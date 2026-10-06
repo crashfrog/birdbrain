@@ -29,7 +29,13 @@ class GatewayServer:
         self.lifecycle_managers: dict[str, LifecycleManager] = {}
 
         for backend in config.backends:
-            health_monitor = HealthMonitor(backend.name)
+            # Collect secondary model backend names for health monitoring
+            secondary_backend_names = [sec.backend_name for sec in backend.secondary_models]
+            health_monitor = HealthMonitor(
+                backend.name,
+                gateway=self.gateway,
+                extra_backend_names=secondary_backend_names,
+            )
             health_monitor.set_unhealthy_callback(self._make_unhealthy_callback(backend.name))
 
             lifecycle_manager = LifecycleManager(
@@ -64,9 +70,11 @@ class GatewayServer:
 
         async def _on_backend_unhealthy() -> None:
             logger.warning(
-                f"[{backend_name}] Backend unhealthy, lifecycle manager will handle rotation"
+                f"[{backend_name}] Backend unhealthy, triggering lifecycle restart"
             )
-            # Lifecycle manager will detect and rotate on next check
+            lifecycle_manager = self.lifecycle_managers.get(backend_name)
+            if lifecycle_manager:
+                await lifecycle_manager.clear_backend_and_restart()
 
         return _on_backend_unhealthy
 
@@ -191,6 +199,8 @@ def status(config: Config) -> None:
             click.echo(f"  Node: {current.get('node', 'unknown')}")
             click.echo(f"  Status: {current['status']}")
             click.echo(f"  Expires: {current['expires_at']}")
+            for backend_name, urls in current.get("registered_backends", {}).items():
+                click.echo(f"  {backend_name}: {', '.join(urls)}")
         else:
             click.echo("Current Job: None")
 

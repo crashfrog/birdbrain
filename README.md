@@ -58,6 +58,15 @@ Each pool runs its own independent Slurm job lifecycle (submission, rotation, he
 
 Existing single-model configs (top-level `[slurm]`/`[model]`, no `[[backends]]`) keep working unchanged — they're automatically treated as one backend pool named `"default"`.
 
+### Replicas and co-located models
+
+A pool can run more than one vLLM server inside its single Slurm job:
+
+- `replicas = N` (under `[backends.slurm]`) launches N copies of the pool's model. The job's GPUs are split evenly between them and the gateway round-robins requests across the copies. If one copy dies, the rest keep serving.
+- `[[backends.secondary_models]]` adds a different model to the same job, pinned to one of its GPUs and served under its own `backend_name`/aliases. This is meant for small sidecars, e.g. an embedding model next to a chat model, called through `POST /v1/embeddings`. Because a sidecar shares its pool's job, it is rotated with that job, and restarting a dead sidecar means restarting the whole job.
+
+Instances use consecutive ports starting at `slurm.port`, and two pools' port ranges must not overlap. A co-located model shares VRAM with the primary, so the two `--gpu-memory-utilization` values must add up to less than 1.0. See the commented examples in `tequila-mule.toml`.
+
 ## Quick Start
 
 ### Prerequisites

@@ -47,9 +47,9 @@ def test_health_endpoint(client):
 
 def test_no_auth_by_default(client, gateway):
     """Test requests succeed when no API key configured."""
-    gateway.backends["default"] = BackendEntry(
-        url="http://fake-backend:50000", model_name="meta-llama/Llama-3.1-8B", job_id="1"
-    )
+    gateway.backends["default"] = [
+        BackendEntry(url="http://fake-backend:50000", model_name="meta-llama/Llama-3.1-8B", job_id="1")
+    ]
 
     # Should not require auth (will fail on backend connection, not auth)
     response = client.post(
@@ -64,9 +64,9 @@ def test_auth_required_when_enabled(gateway):
     """Test auth is enforced when API keys configured."""
     # Add a key
     test_key = gateway.keystore.add_key("test@example.com")
-    gateway.backends["default"] = BackendEntry(
-        url="http://fake-backend:50000", model_name="meta-llama/Llama-3.1-8B", job_id="1"
-    )
+    gateway.backends["default"] = [
+        BackendEntry(url="http://fake-backend:50000", model_name="meta-llama/Llama-3.1-8B", job_id="1")
+    ]
 
     client = TestClient(gateway.app)
 
@@ -157,13 +157,76 @@ async def test_backend_registration_unknown_name_rejected(gateway):
 
 
 @pytest.mark.asyncio
-async def test_set_backend(gateway):
-    """Test atomic backend switching."""
-    await gateway.set_backend("default", "http://node1:50000")
+async def test_set_backend_new_job_replaces_old(gateway):
+    """The first registration from a new job flips the pool to that job."""
+    await gateway.set_backend("default", "http://node1:50000", job_id="job-1")
     assert gateway.get_backend("default") == "http://node1:50000"
 
-    await gateway.set_backend("default", "http://node2:50000")
-    assert gateway.get_backend("default") == "http://node2:50000"
+    await gateway.set_backend("default", "http://node2:50000", job_id="job-2")
+    assert gateway.get_all_backend_urls("default") == ["http://node2:50000"]
+    assert gateway.get_backend_job_id("default") == "job-2"
+
+
+@pytest.mark.asyncio
+async def test_replicas_from_one_job_are_round_robined(gateway):
+    """Instances registered by the same job accumulate and share traffic."""
+    for port in (50000, 50001):
+        await gateway.set_backend(
+            "default", f"http://node1:{port}", model_name="meta-llama/Llama-3.1-8B", job_id="job-1"
+        )
+
+    client = TestClient(gateway.app)
+    with respx.mock:
+        a = respx.post("http://node1:50000/v1/completions").mock(return_value=HttpxResponse(200, json={}))
+        b = respx.post("http://node1:50001/v1/completions").mock(return_value=HttpxResponse(200, json={}))
+        for _ in range(4):
+            client.post("/v1/completions", json={"model": "default", "prompt": "x"})
+
+    assert (a.call_count, b.call_count) == (2, 2)
+
+
+@pytest.fixture
+def colocated_gateway(tmp_path, sample_multi_backend_config_data):
+    """small-model-a with an embedding model co-located in its job."""
+    data = sample_multi_backend_config_data
+    data["paths"] = dict(data["paths"], api_keys_file=str(tmp_path / "api_keys.json"))
+    data["backends"][1]["secondary_models"] = [
+        {
+            "model_name": "nomic-ai/nomic-embed-text-v1.5",
+            "backend_name": "nomic-embed",
+            "aliases": ["embed"],
+        }
+    ]
+    data["backends"][1]["slurm"]["port"] = 50005
+    return Gateway(Config(**data))
+
+
+@pytest.mark.asyncio
+async def test_secondary_model_registers_and_serves_embeddings(colocated_gateway):
+    """A secondary's registration is accepted and /v1/embeddings routes by its alias."""
+
+    class MockRequest:
+        async def json(self):
+            return {
+                "job_id": "7",
+                "node": "g043",
+                "port": 50006,
+                "backend_name": "nomic-embed",
+                "model_name": "nomic-ai/nomic-embed-text-v1.5",
+            }
+
+    await colocated_gateway._register_backend(MockRequest())
+
+    client = TestClient(colocated_gateway.app)
+    with respx.mock:
+        route = respx.post("http://g043:50006/v1/embeddings").mock(
+            return_value=HttpxResponse(200, json={"data": []})
+        )
+        response = client.post("/v1/embeddings", json={"model": "embed", "input": "hello"})
+
+    assert response.status_code == 200
+    assert json.loads(route.calls.last.request.content)["model"] == "nomic-ai/nomic-embed-text-v1.5"
+
 
 
 @pytest.mark.asyncio

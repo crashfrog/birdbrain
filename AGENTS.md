@@ -145,6 +145,14 @@ resolves on a compute node.
 - **Never use `--cpu-offload-gb` for an interactive backend.** It streams weights
   over PCIe every forward pass and cripples decode. It only exists to fit a model
   that otherwise won't load at all.
+- **Co-locating a second model on one GPU** (`[[backends.secondary_models]]`):
+  each vLLM process claims `--gpu-memory-utilization` × total VRAM at startup,
+  so lower the primary's value (e.g. 0.9 → 0.85) to leave room for the
+  secondary (an embedding model needs ~0.08). Instances do not share
+  environment: repeat the cache redirects below in the secondary's own `env`.
+- **If `[paths].job_template` points at a site copy of the template**, refresh
+  that copy whenever the repo template changes; the gateway passes the
+  template an `instances` list, and an older copy will render broken jobs.
 - **Redirect all caches to scratch** so CUDA-graph / torch-compile artifacts don't
   fill a small node-local `/tmp` (symptom: `OSError: [Errno 28] No space left on
   device` during graph capture). Set `VLLM_CACHE_ROOT`, `XDG_CACHE_HOME`,

@@ -77,3 +77,66 @@ port = 50001
 [backends.model]
 name = "google/gemma-3-12b-it"
 vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --enable-prefix-caching"
+
+# --- Load-balanced replicas (several copies of one model in one job) ---
+# `replicas = N` launches N vLLM servers of the primary model inside one
+# Slurm job; the gateway round-robins requests across them. The job's GPUs
+# are split evenly (gpus_per_job must be divisible by replicas), so each
+# replica's --tensor-parallel-size must equal gpus_per_job / replicas.
+# Instances use ports port, port+1, ...; pools' port ranges must not overlap.
+# Example: two TP-1 copies of Gemma on one 2-GPU node.
+# [[backends]]
+# name = "gemma-3-12b-x2"
+# aliases = ["small-lb"]
+#
+# [backends.slurm]
+# partition = "gpu"
+# gres = "gpu:h100:2"
+# gpus_per_job = 2
+# replicas = 2
+# wall_time = "23:00:00"
+# lead_time_minutes = 90
+# port = 50010
+#
+# [backends.model]
+# name = "google/gemma-3-12b-it"
+# vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --enable-prefix-caching"
+
+# --- Co-located secondary model (second model, same job, same GPU) ---
+# A secondary model runs inside its pool's Slurm job, pinned to one GPU of the
+# allocation, and is served under its own backend_name/aliases (clients call
+# /v1/embeddings with model = "embed"). It starts after the primary is healthy
+# and is registered on the next port after the primary's. It shares the job's
+# lifecycle: if it dies, the whole job is restarted.
+# VRAM: each vLLM process claims --gpu-memory-utilization x total VRAM at
+# startup, so primary + secondary must sum below 1.0. Environment is NOT
+# shared between instances — repeat cache redirects (VLLM_CACHE_ROOT, HF_HOME,
+# TMPDIR, ...) in the secondary's own env table.
+# Example: nomic-embed-text next to Gemma on one H100 (replace the gemma pool).
+# [[backends]]
+# name = "gemma-3-12b"
+# aliases = ["small", "fast"]
+#
+# [backends.slurm]
+# partition = "gpu"
+# gres = "gpu:h100:1"
+# gpus_per_job = 1
+# wall_time = "23:00:00"
+# lead_time_minutes = 90
+# port = 50001                # secondary gets 50002
+#
+# [backends.model]
+# name = "google/gemma-3-12b-it"
+# vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --enable-prefix-caching --gpu-memory-utilization 0.85"
+#
+# [[backends.secondary_models]]
+# model_name = "nomic-ai/nomic-embed-text-v1.5"   # pre-fetch to scratch; ~137M params
+# backend_name = "nomic-embed-text"
+# aliases = ["embed", "embeddings"]
+# gpu_device = 0
+# # Embedding (pooling) models are auto-detected by recent vLLM; older builds
+# # need an explicit embed task flag. Smoke-test on your container first.
+# vllm_extra_args = "--trust-remote-code --max-model-len 2048 --gpu-memory-utilization 0.08"
+#
+# [backends.secondary_models.env]
+# HF_HOME = "/scratch/you/hf-cache"

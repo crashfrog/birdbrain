@@ -96,6 +96,47 @@ def test_alias_colliding_with_backend_name_rejected(sample_multi_backend_config_
         Config(**data)
 
 
+def test_replicas_must_divide_gpus(sample_multi_backend_config_data):
+    """Each replica gets an equal GPU slice, so gpus_per_job % replicas must be 0."""
+    data = sample_multi_backend_config_data
+    data["backends"][0]["slurm"].update(gpus_per_job=2, replicas=3)
+
+    with pytest.raises(ValueError, match="divisible"):
+        Config(**data)
+
+
+def test_secondary_gpu_outside_allocation_rejected(sample_multi_backend_config_data):
+    """A secondary pinned to a GPU index the job doesn't own is a config error."""
+    data = sample_multi_backend_config_data
+    data["backends"][1]["secondary_models"] = [
+        {"model_name": "nomic-ai/nomic-embed-text-v1.5", "backend_name": "embed-pool", "gpu_device": 1}
+    ]
+
+    with pytest.raises(ValueError, match="outside"):
+        Config(**data)
+
+
+def test_secondary_ports_overlapping_another_pool_rejected(sample_multi_backend_config_data):
+    """llama owns 50000; adding a replica there would take 50001, small-model-a's port."""
+    data = sample_multi_backend_config_data
+    data["backends"][0]["slurm"]["replicas"] = 2
+
+    with pytest.raises(ValueError, match="overlap"):
+        Config(**data)
+
+
+def test_secondary_backend_name_colliding_with_pool_rejected(sample_multi_backend_config_data):
+    """Secondary backend_names share the gateway's registry with pool names."""
+    data = sample_multi_backend_config_data
+    data["backends"][1]["slurm"]["port"] = 50005
+    data["backends"][1]["secondary_models"] = [
+        {"model_name": "nomic-ai/nomic-embed-text-v1.5", "backend_name": "llama-3.3-70b"}
+    ]
+
+    with pytest.raises(ValueError, match="unique"):
+        Config(**data)
+
+
 def test_wall_time_validation():
     """Test wall_time format validation."""
     from tequila_mule.config import SlurmConfig

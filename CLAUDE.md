@@ -54,14 +54,16 @@ tequila-mule/
 The gateway hosts one or more independently-rotating **backend pools** (e.g. a large model on multiple GPUs plus small models on single GPUs), each configured as a `[[backends]]` entry with its own name, Slurm sizing, model, and optional aliases. The `Gateway` maintains a static routing table (canonical name + model name + aliases → backend pool name) built once at startup, and a per-pool registry of live backend URLs. For each configured pool there is one `LifecycleManager` and one `HealthMonitor` instance — they don't share state, so one pool rotating, cold-starting, or failing never blocks another. Legacy single-model configs (top-level `[slurm]`/`[model]`, no `[[backends]]`) are migrated at config-load time into a single pool named `"default"`.
 
 1. **Gateway** (FastAPI process on login node)
-   - OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/models` endpoints
+   - OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` endpoints
+   - Each pool (and each co-located secondary model) holds a list of live instances; requests round-robin across them. The first registration from a new `job_id` replaces all older entries (the rotation flip)
    - Resolves the target backend pool from the request's `model` field (exact canonical name or alias); unknown models get `400`
    - Rewrites the outgoing `model` field to the resolved pool's actual served model name before proxying via httpx (with streaming)
    - Exposes internal registration endpoint (`POST /internal/register`) for backends to announce themselves — the registration payload must include `backend_name` identifying which pool is registering
    - `GET /v1/models` lists canonical model names and aliases for every currently-live pool
 
 2. **Lifecycle Manager** (one instance per backend pool, background task in gateway)
-   - Tracks job state: `{job_id, node, port, status, submitted_at, expires_at}`
+   - Tracks job state: `{job_id, node, status, submitted_at, expires_at, expected_ports, registered_backends}`; old single-`port`/`backend_url` state files are migrated on load
+   - One job may run several vLLM instances (`replicas` of the primary plus `secondary_models`); the job is promoted only after every planned instance has registered
    - Submits new Slurm job at `wall_time - lead_time` before current job expiry
    - Polls `squeue`/`scontrol` until new job reaches `RUNNING`
    - Waits for registration callback from new job (matched by backend pool name)
@@ -70,8 +72,8 @@ The gateway hosts one or more independently-rotating **backend pools** (e.g. a l
    - Persists state to its own `state-<pool-name>.json`; a `"default"` pool falls back to reading the legacy `state.json` on first load if its own file doesn't exist yet (in-place upgrade path)
 
 3. **Health Monitor** (one instance per backend pool, background task in gateway)
-   - Periodically polls `GET /health` on that pool's active backend
-   - On failure: marks unhealthy, triggers emergency lifecycle check for that pool only
+   - Periodically polls `GET /health` on every registered instance of the pool and its secondary models
+   - Restarts the job only when some served backend has no healthy instance left; a partial replica outage is logged as degraded
    - Distinguishes between unreachable node vs. slow backend
 
 **Job rotation timeline example:**
@@ -160,7 +162,7 @@ The gateway reads `tequila-mule.toml` from the current directory or `~/.tequila-
 
 Key config sections:
 - `[gateway]`: host, port, api_key, request_retry_window_seconds
-- `[[backends]]`: one entry per model pool — `name`, `aliases`, `[backends.slurm]` (partition, gres, wall_time, lead_time_minutes, port), `[backends.model]` (name, vllm_extra_args)
+- `[[backends]]`: one entry per model pool — `name`, `aliases`, `[backends.slurm]` (partition, gres, gpus_per_job, replicas, wall_time, lead_time_minutes, port), `[backends.model]` (name, vllm_extra_args, env), optional `[[backends.secondary_models]]` (model_name, backend_name, aliases, gpu_device, vllm_extra_args, env)
 - `[paths]`: job_template, state_file, log_dir
 - Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still accepted and migrated into a single `"default"` pool
 

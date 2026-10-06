@@ -19,113 +19,158 @@ set -euo pipefail
 JOB_WORKDIR="$(mktemp -d)"
 cd "${JOB_WORKDIR}"
 
-# Trap SIGTERM to gracefully deregister before job termination
-trap 'cleanup' TERM INT
+# One PID per vLLM instance (primary replicas + co-located secondaries).
+PIDS=()
 
 cleanup() {
     echo "Received termination signal, cleaning up..."
-    # TODO: POST to gateway /internal/deregister
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+        pkill -P "${pid}" 2>/dev/null || true
+        kill "${pid}" 2>/dev/null || true
+    done
     exit 0
 }
+trap cleanup TERM INT
 
-echo "=== tequila-mule vLLM Job ==="
+echo "=== tequila-mule vLLM Job ({{ instances | length }} instance(s)) ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 echo "Started: $(date)"
 
-# vLLM server details
-VLLM_PORT="{{ vllm_port }}"
-VLLM_HOST="0.0.0.0"
-MODEL_NAME="{{ model_name }}"
 CONTAINER="{{ container_path }}"
-BACKEND_NAME="{{ backend_name }}"
 
 # Gateway registration details
 GATEWAY_HOST="{{ gateway_host }}"
 GATEWAY_PORT="{{ gateway_port }}"
 GATEWAY_URL="http://${GATEWAY_HOST}:${GATEWAY_PORT}"
 
-echo "Model: ${MODEL_NAME}"
-echo "Container: ${CONTAINER}"
-echo "vLLM will bind to ${VLLM_HOST}:${VLLM_PORT}"
+# Instances address GPUs by index into this job's allocation. Slurm exports
+# the allocated devices in CUDA_VISIBLE_DEVICES (physical ids when devices are
+# not cgroup-constrained), so map index -> device id through that list rather
+# than assuming the allocation starts at GPU 0.
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a JOB_GPUS <<< "${CUDA_VISIBLE_DEVICES}"
+else
+    JOB_GPUS=($(seq 0 15))
+fi
+echo "Job GPUs: ${JOB_GPUS[*]}"
 
-# Container environment (from [backends.model].env). SINGULARITYENV_ crosses
-# each variable into the container. Build-specific kernel-stability toggles
-# live here rather than being hardcoded, so swapping to a newer vLLM container
-# that fixes a kernel is a config edit, not a template edit. Example:
-#   [backends.model.env]
-#   VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER = "0"  # unstable FP8 GEMM on 0.25.1
-{% for key, value in (singularity_env | default({})).items() %}
-export SINGULARITYENV_{{ key }}="{{ value }}"
-{% endfor %}
+gpus_for() {
+    local out=() i
+    for i in "$@"; do
+        if [ -z "${JOB_GPUS[$i]:-}" ]; then
+            echo "ERROR: GPU index ${i} is not in this job's allocation (${JOB_GPUS[*]})" >&2
+            return 1
+        fi
+        out+=("${JOB_GPUS[$i]}")
+    done
+    (IFS=','; echo "${out[*]}")
+}
 
-# Start vLLM server in Singularity container.
-# --bind {{ bind_path | default('/nfs') }}: the model weights and container live
-#   on the cluster scratch filesystem, which Singularity does NOT auto-mount;
-#   without this the container reports "Incorrect path_or_model_id".
-# We invoke the OpenAI API server module directly rather than the `vllm` CLI
-#   shim, which is not reliably on PATH inside the container on compute nodes.
-echo "Starting vLLM server..."
-singularity exec --nv --bind {{ bind_path | default('/nfs') }} "${CONTAINER}" \
-    python3 -m vllm.entrypoints.openai.api_server \
-    --model "${MODEL_NAME}" \
-    --host "${VLLM_HOST}" \
-    --port "${VLLM_PORT}" \
-    {{ vllm_extra_args }} &
-
-VLLM_PID=$!
-echo "vLLM PID: ${VLLM_PID}"
-
-# Wait for vLLM to be ready (check /health endpoint)
-echo "Waiting for vLLM to be ready..."
 # Graph-mode (CUDA graphs / torch.compile) cold start is slow: first-run
 # torch.compile can take ~2 min plus weight load and graph capture. 5 min was
 # too tight and killed vLLM mid-capture; 20 min gives comfortable margin.
 # With the compile cache redirected to scratch (see [backends.model].env),
-# subsequent starts reuse it and come up far faster.
-MAX_WAIT=1200  # 20 minutes
-ELAPSED=0
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    if curl -s http://localhost:${VLLM_PORT}/health > /dev/null 2>&1; then
-        echo "vLLM is ready!"
-        break
-    fi
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-done
+# subsequent starts reuse it and come up far faster. One deadline covers every
+# instance, matching the gateway's 20-minute registration wait.
+DEADLINE=$((SECONDS + 1200))
 
-if [ $ELAPSED -ge $MAX_WAIT ]; then
-    echo "ERROR: vLLM failed to start within ${MAX_WAIT} seconds"
-    kill $VLLM_PID 2>/dev/null || true
-    exit 1
-fi
-
-# Register with gateway
-NODE=$(hostname)
-echo "Registering with gateway at ${GATEWAY_URL}"
-REGISTER_PAYLOAD=$(cat <<EOF
-{
-  "job_id": "${SLURM_JOB_ID}",
-  "node": "${NODE}",
-  "port": ${VLLM_PORT},
-  "backend_name": "${BACKEND_NAME}",
-  "model_name": "${MODEL_NAME}"
+wait_healthy() {
+    local port pid
+    for port in "$@"; do
+        until curl -sf "http://localhost:${port}/health" > /dev/null 2>&1; do
+            for pid in "${PIDS[@]}"; do
+                if ! kill -0 "${pid}" 2>/dev/null; then
+                    echo "ERROR: a vLLM instance exited during startup" >&2
+                    return 1
+                fi
+            done
+            if [ "${SECONDS}" -ge "${DEADLINE}" ]; then
+                echo "ERROR: instance on port ${port} not healthy within 20 minutes" >&2
+                return 1
+            fi
+            sleep 5
+        done
+        echo "Instance on port ${port} is ready"
+    done
 }
-EOF
-)
 
-curl -X POST \
-    -H "Content-Type: application/json" \
-    -d "${REGISTER_PAYLOAD}" \
-    "${GATEWAY_URL}/internal/register" || {
-        echo "WARNING: Failed to register with gateway, but continuing..."
-    }
+{#
+  Each instance runs in its own subshell so its environment never leaks into
+  the next one. SINGULARITYENV_ crosses each variable into the container.
+  Build-specific kernel-stability toggles live in [backends.model].env rather
+  than being hardcoded, so swapping to a newer vLLM container that fixes a
+  kernel is a config edit, not a template edit.
+  --bind: the model weights and container live on the cluster scratch
+  filesystem, which Singularity does NOT auto-mount; without it the container
+  reports "Incorrect path_or_model_id".
+  The OpenAI API server module is invoked directly rather than the `vllm` CLI
+  shim, which is not reliably on PATH inside the container on compute nodes.
+#}
+{% macro launch(inst) %}
+echo "Starting {{ inst.backend_name }} ({{ inst.model_name }}) on port {{ inst.port }}{% if inst.gpu_indices is not none %}, job GPU index {{ inst.gpu_indices | join(',') }}{% endif %}"
+(
+{% if inst.gpu_indices is not none %}
+    DEVICES="$(gpus_for {{ inst.gpu_indices | join(' ') }})" || exit 1
+    export CUDA_VISIBLE_DEVICES="${DEVICES}" SINGULARITYENV_CUDA_VISIBLE_DEVICES="${DEVICES}"
+{% endif %}
+{% for key, value in inst.env.items() %}
+    export SINGULARITYENV_{{ key }}="{{ value }}"
+{% endfor %}
+    exec singularity exec --nv --bind {{ bind_path | default('/nfs') }} "${CONTAINER}" \
+        python3 -m vllm.entrypoints.openai.api_server \
+        --model "{{ inst.model_name }}" \
+        --host 0.0.0.0 \
+        --port {{ inst.port }} \
+        {{ inst.vllm_extra_args }}
+) &
+PIDS+=($!)
+{% endmacro %}
 
-echo "vLLM server running. Waiting for job termination..."
+{% set primaries = instances | rejectattr('secondary') | list %}
+{% set secondaries = instances | selectattr('secondary') | list %}
+# Primary replicas own disjoint GPUs, so they start concurrently.
+{% for inst in primaries %}
+{{ launch(inst) }}
+{% endfor %}
+if ! wait_healthy {% for inst in primaries %}{{ inst.port }} {% endfor %}; then
+    cleanup
+fi
+{% if secondaries %}
 
-# Keep job alive until Slurm kills it or vLLM exits
-wait $VLLM_PID
-EXIT_CODE=$?
+# Secondary models share a GPU with a primary. Start them only once the
+# primary has finished allocating, so vLLM's startup memory profiling in each
+# process doesn't race the other's allocations.
+{% for inst in secondaries %}
+{{ launch(inst) }}
+{% endfor %}
+if ! wait_healthy {% for inst in secondaries %}{{ inst.port }} {% endfor %}; then
+    cleanup
+fi
+{% endif %}
 
-echo "vLLM exited with code ${EXIT_CODE}"
+# Register every instance with the gateway
+NODE=$(hostname)
+register() {
+    local port="$1" backend_name="$2" model_name="$3"
+    echo "Registering ${backend_name} at http://${NODE}:${port}"
+    curl -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"job_id\": \"${SLURM_JOB_ID}\", \"node\": \"${NODE}\", \"port\": ${port}, \"backend_name\": \"${backend_name}\", \"model_name\": \"${model_name}\"}" \
+        "${GATEWAY_URL}/internal/register" || {
+            echo "WARNING: Failed to register ${backend_name} on port ${port}, but continuing..."
+        }
+}
+{% for inst in instances %}
+register {{ inst.port }} "{{ inst.backend_name }}" "{{ inst.model_name }}"
+{% endfor %}
+
+echo "All vLLM instances running. Waiting for job termination..."
+
+# Keep the job alive until Slurm kills it or every instance exits. A single
+# crashed replica leaves the others serving; the gateway health monitor
+# restarts the job once a backend has no healthy instance left.
+for pid in "${PIDS[@]}"; do
+    wait "${pid}" || echo "vLLM instance ${pid} exited with code $?"
+done
 cleanup

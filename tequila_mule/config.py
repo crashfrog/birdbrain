@@ -33,9 +33,14 @@ class SlurmConfig(BaseModel):
     gpus_per_job: int = 2
     wall_time: str = "23:00:00"
     lead_time_minutes: int = 90
-    port: int = 50000  # Fixed port for vLLM on compute nodes
+    port: int = 50000  # Port of the first instance; further instances use port+1, port+2, ...
     memory: Optional[str] = None  # Slurm --mem, e.g. "128GB"; omitted if unset
     cpus_per_task: Optional[int] = None  # Slurm --cpus-per-task; omitted if unset
+    # Independent vLLM replicas of the primary model inside one Slurm job; the
+    # gateway round-robins across them. The job's GPUs are split evenly, so
+    # each replica gets gpus_per_job // replicas GPUs (its tensor-parallel
+    # size). With replicas = 1 the primary sees every GPU in the allocation.
+    replicas: int = Field(default=1, ge=1)
 
     @field_validator("wall_time")
     @classmethod
@@ -68,13 +73,53 @@ class ModelConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+class SecondaryModelConfig(BaseModel):
+    """A secondary model co-located in a backend pool's Slurm job."""
+
+    model_name: str  # What vLLM receives as --model
+    backend_name: str  # Name used in /internal/register
+    aliases: list[str] = Field(default_factory=list)
+    vllm_extra_args: str = ""
+    env: dict[str, str] = Field(default_factory=dict)
+    # Index into the job's GPU allocation this model runs on. Shares that GPU
+    # with the primary model, so both sides' --gpu-memory-utilization must sum
+    # to less than 1.0.
+    gpu_device: int = Field(default=0, ge=0)
+
+
 class BackendPoolConfig(BaseModel):
-    """A single rotating backend pool: one Slurm job lineage serving one model."""
+    """A backend pool: one Slurm job lineage serving a primary model (optionally
+    replicated) plus zero or more co-located secondary models.
+
+    Every instance shares the job's lifecycle: rotation, health, restart.
+    """
 
     name: str
     model: ModelConfig = Field(default_factory=ModelConfig)
     slurm: SlurmConfig = Field(default_factory=SlurmConfig)
     aliases: list[str] = Field(default_factory=list)
+    secondary_models: list[SecondaryModelConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_gpu_layout(self) -> "BackendPoolConfig":
+        gpus = self.slurm.gpus_per_job
+        if gpus % self.slurm.replicas != 0:
+            raise ValueError(
+                f"[{self.name}] gpus_per_job ({gpus}) must be divisible by replicas "
+                f"({self.slurm.replicas})"
+            )
+        for sec in self.secondary_models:
+            if sec.gpu_device >= gpus:
+                raise ValueError(
+                    f"[{self.name}] secondary model {sec.backend_name!r} gpu_device "
+                    f"{sec.gpu_device} is outside the job's {gpus} GPU(s)"
+                )
+        return self
+
+    def instance_ports(self) -> list[int]:
+        """Ports of every instance in launch order: primary replicas, then secondaries."""
+        count = self.slurm.replicas + len(self.secondary_models)
+        return [self.slurm.port + i for i in range(count)]
 
 
 class PathsConfig(BaseModel):
@@ -112,22 +157,39 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def _validate_backends(self) -> "Config":
+        """Backend names, aliases and instance ports must be unique across every
+        pool and secondary model; aliases must not shadow a name or model id."""
         names = [b.name for b in self.backends]
+        names += [sec.backend_name for b in self.backends for sec in b.secondary_models]
         if len(names) != len(set(names)):
-            raise ValueError("Backend pool names must be unique")
+            raise ValueError(
+                "Backend names (pool names and secondary_models.backend_name) must be unique"
+            )
 
-        aliases = [alias for b in self.backends for alias in b.aliases]
+        aliases = [a for b in self.backends for a in b.aliases]
+        aliases += [a for b in self.backends for sec in b.secondary_models for a in sec.aliases]
         if len(aliases) != len(set(aliases)):
-            raise ValueError("Backend aliases must be unique across all backends")
+            raise ValueError("Aliases must be unique across all backends and secondary models")
 
-        reserved = set(names) | {b.model.name for b in self.backends}
-        collisions = set(aliases) & reserved
+        model_names = {b.model.name for b in self.backends}
+        model_names |= {sec.model_name for b in self.backends for sec in b.secondary_models}
+        collisions = set(aliases) & (set(names) | model_names)
         if collisions:
             raise ValueError(
                 f"Aliases must not collide with a backend name or model name: {collisions}"
             )
 
+        # Two pools' jobs can land on the same node, so their instance port
+        # ranges must never overlap.
+        ports = [p for b in self.backends for p in b.instance_ports()]
+        if len(ports) != len(set(ports)):
+            raise ValueError(
+                "Instance ports overlap between backend pools; each pool uses "
+                "slurm.port .. slurm.port + replicas + len(secondary_models) - 1"
+            )
+
         return self
+
 
 
 def load_config(config_path: Optional[Path] = None) -> Config:

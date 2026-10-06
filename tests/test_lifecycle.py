@@ -1,5 +1,6 @@
 """Tests for lifecycle manager."""
 
+import json
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,11 +38,11 @@ def test_job_state_serialization():
     job = JobState(
         job_id="12345",
         node="gpu-node-01",
-        port=50000,
         status="RUNNING",
         submitted_at="2026-05-26T10:00:00",
         expires_at="2026-05-27T09:00:00",
-        backend_url="http://gpu-node-01:50000",
+        expected_ports=[50000],
+        registered_backends={"default": ["http://gpu-node-01:50000"]},
     )
 
     # Should be serializable
@@ -50,6 +51,8 @@ def test_job_state_serialization():
     data = asdict(job)
     assert data["job_id"] == "12345"
     assert data["node"] == "gpu-node-01"
+    assert data["expected_ports"] == [50000]
+    assert data["registered_backends"] == {"default": ["http://gpu-node-01:50000"]}
 
     # Round-trip
     job2 = JobState(**data)
@@ -65,11 +68,11 @@ def test_save_and_load_state(lifecycle_manager):
     lifecycle_manager.current_job = JobState(
         job_id="12345",
         node="gpu-node-01",
-        port=50000,
         status="RUNNING",
         submitted_at=submitted_at.isoformat(),
         expires_at=expires_at.isoformat(),
-        backend_url="http://gpu-node-01:50000",
+        expected_ports=[50000],
+        registered_backends={"default": ["http://gpu-node-01:50000"]},
     )
 
     # Save state
@@ -108,22 +111,22 @@ def test_two_managers_do_not_share_state(mock_gateway, tmp_path):
     manager_a.current_job = JobState(
         job_id="aaa",
         node="g001",
-        port=50000,
         status="RUNNING",
         submitted_at=submitted_at.isoformat(),
         expires_at=expires_at.isoformat(),
-        backend_url="http://g001:50000",
+        expected_ports=[50000],
+        registered_backends={"backend-a": ["http://g001:50000"]},
     )
     manager_a._save_state()
 
     manager_b.current_job = JobState(
         job_id="bbb",
         node="g002",
-        port=50001,
         status="RUNNING",
         submitted_at=submitted_at.isoformat(),
         expires_at=expires_at.isoformat(),
-        backend_url="http://g002:50001",
+        expected_ports=[50001],
+        registered_backends={"backend-b": ["http://g002:50001"]},
     )
     manager_b._save_state()
 
@@ -145,20 +148,26 @@ def test_legacy_state_file_migration(mock_gateway, tmp_path):
     legacy_manager = LifecycleManager(
         config.backends[0], config.paths, "gw-host", 8765, mock_gateway
     )
-    # Simulate the pre-upgrade shape: write directly to legacy state.json
+    # Simulate the pre-upgrade shape: write old-format state directly
     legacy_manager.state_file = legacy_manager._legacy_state_file
     submitted_at = datetime.utcnow()
     expires_at = submitted_at + timedelta(hours=23)
-    legacy_manager.current_job = JobState(
-        job_id="legacy-1",
-        node="g999",
-        port=50000,
-        status="RUNNING",
-        submitted_at=submitted_at.isoformat(),
-        expires_at=expires_at.isoformat(),
-        backend_url="http://g999:50000",
-    )
-    legacy_manager._save_state()
+    # Write old-format state (with port and backend_url, not expected_ports/registered_backends)
+    legacy_state = {
+        "current_job": {
+            "job_id": "legacy-1",
+            "node": "g999",
+            "port": 50000,
+            "status": "RUNNING",
+            "submitted_at": submitted_at.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "backend_url": "http://g999:50000",
+        },
+        "pending_job": None,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    with open(legacy_manager._legacy_state_file, "w") as f:
+        json.dump(legacy_state, f)
 
     # New manager, as constructed post-upgrade, uses the new per-backend path
     new_manager = LifecycleManager(
@@ -171,6 +180,9 @@ def test_legacy_state_file_migration(mock_gateway, tmp_path):
 
     assert new_manager.current_job is not None
     assert new_manager.current_job.job_id == "legacy-1"
+    # After migration, expected_ports should be populated
+    assert new_manager.current_job.expected_ports == [50000]
+    assert new_manager.current_job.registered_backends == {"default": ["http://g999:50000"]}
 
 
 @patch("tequila_mule.lifecycle.subprocess.run")
@@ -234,3 +246,102 @@ def test_get_job_info_not_found(mock_subprocess_run, lifecycle_manager):
     info = lifecycle_manager._get_job_info("12345")
 
     assert info is None
+
+
+def _colocated_manager(gateway, tmp_path, **slurm):
+    config = Config(
+        backends=[
+            {
+                "name": "laguna-xs",
+                "model": {"name": "/m/laguna-xs"},
+                "slurm": {"gpus_per_job": 1, "port": 50001, **slurm},
+                "secondary_models": [
+                    {"model_name": "/m/nomic", "backend_name": "nomic-embed", "aliases": ["embed"]}
+                ],
+            }
+        ]
+    )
+    config.paths.state_file = str(tmp_path / "state.json")
+    return LifecycleManager(config.backends[0], config.paths, "gw-host", 8765, gateway)
+
+
+def test_instance_plan_splits_gpus_between_replicas(mock_gateway, tmp_path):
+    """Replicas get disjoint GPU slices; a single replica inherits the whole
+    allocation (so TP>1 keeps every GPU); secondaries follow, pinned."""
+    manager = _colocated_manager(mock_gateway, tmp_path, gpus_per_job=4, replicas=2)
+    plan = manager._build_instance_plan()
+    assert [(i.port, i.backend_name, i.gpu_indices, i.secondary) for i in plan] == [
+        (50001, "laguna-xs", [0, 1], False),
+        (50002, "laguna-xs", [2, 3], False),
+        (50003, "nomic-embed", [0], True),
+    ]
+
+    single = _colocated_manager(mock_gateway, tmp_path, gpus_per_job=2)
+    assert single._build_instance_plan()[0].gpu_indices is None
+
+
+@pytest.mark.asyncio
+async def test_job_not_promoted_until_secondary_registers(mock_gateway, tmp_path):
+    """Promotion waits for every planned backend, not just the primary."""
+    registry = {"laguna-xs": ["http://g043:50001"]}
+    mock_gateway.get_backend_urls_by_job = lambda name, job_id: registry.get(name, [])
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+    job = manager._record_pending_job("77")
+
+    async def register_sidecar(_seconds):
+        assert manager.current_job is None, "promoted before the secondary registered"
+        registry["nomic-embed"] = ["http://g043:50002"]
+
+    with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
+            patch("tequila_mule.lifecycle.asyncio.sleep", side_effect=register_sidecar):
+        await manager._wait_for_job_ready(job)
+
+    assert manager.current_job is job
+    assert job.registered_backends == {
+        "laguna-xs": ["http://g043:50001"],
+        "nomic-embed": ["http://g043:50002"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_cold_start_records_pending_job(mock_gateway, tmp_path):
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    with patch.object(manager, "_submit_job", return_value="88"), \
+            patch.object(manager, "_wait_for_job_ready", AsyncMock()):
+        await manager._cold_start()
+
+    reloaded = _colocated_manager(mock_gateway, tmp_path)
+    reloaded._load_state()
+    assert reloaded.pending_job.job_id == "88"
+    assert reloaded.pending_job.expected_ports == [50001, 50002]
+
+
+@pytest.mark.asyncio
+async def test_start_rehydrates_every_registered_backend(mock_gateway, tmp_path):
+    """A gateway restart re-registers the primary and the secondary from state."""
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.current_job = JobState(
+        job_id="55",
+        node="g043",
+        status="RUNNING",
+        submitted_at=datetime.utcnow().isoformat(),
+        expires_at=(datetime.utcnow() + timedelta(hours=40)).isoformat(),
+        expected_ports=[50001, 50002],
+        registered_backends={
+            "laguna-xs": ["http://g043:50001"],
+            "nomic-embed": ["http://g043:50002"],
+        },
+    )
+    manager._save_state()
+
+    restarted = _colocated_manager(mock_gateway, tmp_path)
+    with patch.object(restarted, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}):
+        await restarted.start()
+    await restarted.stop()
+
+    calls = {(c.args[0], c.args[1], c.kwargs["model_name"]) for c in mock_gateway.set_backend.call_args_list}
+    assert calls == {
+        ("laguna-xs", "http://g043:50001", "/m/laguna-xs"),
+        ("nomic-embed", "http://g043:50002", "/m/nomic"),
+    }
