@@ -68,7 +68,8 @@ The gateway hosts one or more independently-rotating **backend pools** (e.g. a l
    - Polls `squeue`/`scontrol` until new job reaches `RUNNING`
    - Waits for registration callback from new job (matched by backend pool name)
    - Atomically swaps that pool's active backend once new job passes health check
-   - On cold start: submits immediately and blocks until backend is available
+   - On cold start: submits immediately and blocks until backend is available; a replacement that dies, never registers, or is marked unhealthy is resubmitted after an exponential backoff (60 s doubling to 30 min, `RESTART_BACKOFF_*` in `lifecycle.py`), reset by the first passing health check
+   - Every job it stops tracking is `scancel`led: one that misses the 20-minute registration deadline, a queued rotation job superseded by a cold start, and a pending job found in state at gateway startup
    - Persists state to its own `state-<pool-name>.json`; a `"default"` pool falls back to reading the legacy `state.json` on first load if its own file doesn't exist yet (in-place upgrade path)
 
 3. **Health Monitor** (one instance per backend pool, background task in gateway)
@@ -178,6 +179,7 @@ Key config sections:
 - Template: `tequila_mule/templates/vllm_job.sh.j2` (shared across all backend pools; differentiated purely by Jinja variables — gres, model, args, port, backend_name)
 - Rendered with live parameters (job_id, port, model, backend_name)
 - Job posts to gateway `/internal/register` once vLLM is accepting requests, including `backend_name` so the gateway knows which pool is registering
+- Before launching, the job waits up to 60 s for every planned port to be free on its node and exits non-zero otherwise, so a leftover vLLM from another job can't satisfy its localhost readiness probe
 - Job traps `SIGTERM` to post to `/internal/deregister` before expiry
 
 ### Backend Registration & Health

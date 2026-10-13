@@ -16,6 +16,15 @@ from .config import BackendPoolConfig, PathsConfig
 
 logger = logging.getLogger(__name__)
 
+# Backoff between replacement jobs after consecutive failures (a job that
+# died, never registered, or was marked unhealthy). Without it, a fault that
+# kills every replacement — e.g. the login node losing its route to the
+# compute nodes, so health checks fail while registration callbacks still
+# land — resubmits a GPU job every few minutes indefinitely. Delays double
+# from the base up to the cap; one passing health check resets them.
+RESTART_BACKOFF_BASE_SECONDS = 60
+RESTART_BACKOFF_MAX_SECONDS = 1800
+
 
 @dataclass
 class VLLMInstance:
@@ -85,6 +94,9 @@ class LifecycleManager:
         # squeue can transiently return empty (e.g. brief scheduler hiccup);
         # requiring 3 misses (~90s) avoids false-positive restarts.
         self._squeue_fail_count: int = 0
+        # Replacement jobs that failed in a row since the last passing health
+        # check; drives the resubmission backoff (RESTART_BACKOFF_*).
+        self._consecutive_failures: int = 0
 
         # Setup Jinja2 for job template rendering
         template_dir = Path(paths.job_template).parent
@@ -266,6 +278,43 @@ class LifecycleManager:
         except subprocess.CalledProcessError:
             return None
 
+    def _cancel_job(self, job: JobState, reason: str) -> None:
+        """scancel a job this manager is about to stop tracking, so it can't
+        keep running untracked, holding GPUs and ports on its node."""
+        logger.info(f"[{self.name}] Cancelling job {job.job_id}: {reason}")
+        subprocess.run(["scancel", job.job_id], capture_output=True)
+
+    def _restart_delay(self) -> int:
+        """Seconds to wait before submitting the next replacement job."""
+        if self._consecutive_failures == 0:
+            return 0
+        return min(
+            RESTART_BACKOFF_BASE_SECONDS * 2 ** (self._consecutive_failures - 1),
+            RESTART_BACKOFF_MAX_SECONDS,
+        )
+
+    def record_healthy(self) -> None:
+        """Health monitor reached every backend this pool serves: the current
+        job works, so end the failure streak and its backoff."""
+        if self._consecutive_failures:
+            logger.info(
+                f"[{self.name}] Backend healthy, resetting restart backoff "
+                f"after {self._consecutive_failures} failed job(s)"
+            )
+        self._consecutive_failures = 0
+
+    def _submit_pending_job(self) -> Optional[JobState]:
+        """Submit and track a job. An sbatch failure counts toward the backoff
+        and returns None: slurmctld can be unreachable during the same network
+        faults that kill jobs, and the caller retries after the delay."""
+        try:
+            return self._record_pending_job(self._submit_job())
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace").strip() if e.stderr else ""
+            logger.error(f"[{self.name}] sbatch failed (exit {e.returncode}): {stderr}")
+            self._consecutive_failures += 1
+            return None
+
     async def start(self) -> None:
         """Start lifecycle manager."""
         self.running = True
@@ -292,10 +341,19 @@ class LifecycleManager:
                             job_id=self.current_job.job_id,
                         )
 
+        # A pending job in saved state belonged to a rotation or cold start the
+        # previous process was waiting on. Nothing resumes that wait, so cancel
+        # it rather than let it start later, untracked, on some node.
+        if self.pending_job:
+            self._cancel_job(self.pending_job, "pending job from a previous gateway run")
+            self.pending_job = None
+            self._save_state()
+
         # Cold start: submit job immediately if no current job.
         # Run as a background task so uvicorn finishes startup and can
         # accept the /internal/register callback from the compute node.
         if not self.current_job:
+            self._restart_in_progress = True
             asyncio.create_task(self._cold_start())
 
         self.task = asyncio.create_task(self._rotation_loop())
@@ -328,15 +386,35 @@ class LifecycleManager:
         return self.pending_job
 
     async def _cold_start(self) -> None:
-        """Handle cold start - no current job."""
-        logger.info(f"[{self.name}] Cold start: submitting initial job")
-        job = self._record_pending_job(self._submit_job())
+        """Submit jobs until one registers every instance, backing off after
+        each failed attempt.
 
-        # Wait for job to become current. Release the restart guard however
-        # this ends (registered, FAILED, or 20-min timeout) so a later failure
-        # can trigger another restart instead of being skipped forever.
+        Callers set `_restart_in_progress` first. It is released however this
+        ends, so a later failure can trigger another restart instead of being
+        skipped forever.
+        """
         try:
-            await self._wait_for_job_ready(job)
+            while self.running:
+                delay = self._restart_delay()
+                if delay:
+                    logger.warning(
+                        f"[{self.name}] {self._consecutive_failures} consecutive failed job(s); "
+                        f"waiting {delay}s before resubmitting"
+                    )
+                    await asyncio.sleep(delay)
+                    if not self.running:
+                        return
+                logger.info(f"[{self.name}] Cold start: submitting initial job")
+                job = self._submit_pending_job()
+                if job is None:
+                    continue
+                await self._wait_for_job_ready(job)
+                if self.current_job is job:
+                    return
+                self._consecutive_failures += 1
+                if self.pending_job is job:
+                    self.pending_job = None
+                    self._save_state()
         finally:
             self._restart_in_progress = False
 
@@ -371,6 +449,9 @@ class LifecycleManager:
         while self.running:
             if (datetime.utcnow() - start_time).total_seconds() > 1200:
                 logger.error(f"[{self.name}] Job {job.job_id} failed to register within 20 minutes")
+                # Still RUNNING in Slurm: left alone it would hold its GPUs and
+                # ports untracked until wall time.
+                self._cancel_job(job, "did not register within 20 minutes")
                 job.status = "FAILED"
                 self._save_state()
                 return
@@ -411,12 +492,17 @@ class LifecycleManager:
             logger.warning(f"[{self.name}] Restart already in progress, skipping")
             return
         self._restart_in_progress = True
+        self._consecutive_failures += 1
         await self._clear_gateway_backends()
         if self.current_job:
             # The job may still be RUNNING in Slurm with a hung vLLM. Cancel it
             # so it releases the GPU and port before the replacement starts.
-            logger.info(f"[{self.name}] Cancelling unhealthy job {self.current_job.job_id}")
-            subprocess.run(["scancel", self.current_job.job_id], capture_output=True)
+            self._cancel_job(self.current_job, "backend unhealthy")
+        if self.pending_job:
+            # A rotation replacement still queued or starting. The cold start
+            # supersedes it; left running it could land on the same node as the
+            # replacement, and whichever registers second hides the other.
+            self._cancel_job(self.pending_job, "superseded by cold start")
         self.current_job = None
         self.pending_job = None
         self._save_state()
@@ -447,6 +533,7 @@ class LifecycleManager:
                             f"cold-starting replacement"
                         )
                         self._restart_in_progress = True
+                        self._consecutive_failures += 1
                         await self._clear_gateway_backends()
                         self.current_job = None
                         self._save_state()
@@ -471,9 +558,20 @@ class LifecycleManager:
                 # Submit next job
                 logger.info(f"[{self.name}] Rotation window reached, submitting next job")
 
-                job = self._record_pending_job(self._submit_job())
+                job = self._submit_pending_job()
+                if job is None:
+                    await asyncio.sleep(self._restart_delay())
+                    continue
 
                 # Wait for pending job to be ready, then promote
                 await self._wait_for_job_ready(job)
+                if self.pending_job is job:
+                    # Neither promoted nor superseded by a cold start: it died
+                    # or never registered. Clear it so the next pass retries,
+                    # after the backoff.
+                    self.pending_job = None
+                    self._save_state()
+                    self._consecutive_failures += 1
+                    await asyncio.sleep(self._restart_delay())
 
             await asyncio.sleep(30)  # Check every 30s

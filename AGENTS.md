@@ -227,4 +227,6 @@ start the gateway.
 | `No space left on device` during graph capture | compile/graph cache on small node-local `/tmp` | redirect caches to scratch via `SINGULARITYENV_*` (step 5) |
 | `illegal memory access` at "Capturing CUDA graphs" | graph capture unstable on this GPU topology | `--disable-custom-all-reduce`, then `--enforce-eager` (step 5) |
 | Job RUNNING but gateway never flips to it | compute node can't reach login-node gateway port | fix connectivity or use polling fallback (step 6) |
+| Jobs register, then are cancelled as unhealthy minutes later, over and over; `unreachable: All connection attempts failed` in `gateway.log` | login node can't reach the compute node (check `ip neigh` / `curl http://<node>:<port>/health` from the login node; `No route to host` = network fault) | cluster admins; the gateway backs off resubmission (up to 30 min) until a health check passes (step 6) |
+| Job log shows `port … is already in use` and exits | a vLLM from another job still holds the port on that node | `squeue -u $USER` for an untracked `tequila-mule-vllm` job on that node; `scancel` it |
 | Replacement job late; clients see a gap | `lead_time_minutes` < queue wait | raise `lead_time_minutes` (step 7) |

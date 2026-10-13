@@ -200,7 +200,9 @@ For production, use `nohup` or systemd user unit:
 nohup tequila-mule start > ~/.tequila-mule/logs/gateway.log 2>&1 &
 ```
 
-The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates each backend pool's job state from its own `~/.tequila-mule/state-<pool-name>.json` and resumes normal operation. (A pool named `"default"` — the legacy single-model shape — falls back to the older `~/.tequila-mule/state.json` if its own state file doesn't exist yet, so upgrading an existing single-model deployment in place doesn't lose track of an already-running job.)
+The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates each backend pool's job state from its own `~/.tequila-mule/state-<pool-name>.json` and resumes normal operation; a rotation job that was still pending is cancelled and resubmitted. (A pool named `"default"` — the legacy single-model shape — falls back to the older `~/.tequila-mule/state.json` if its own state file doesn't exist yet, so upgrading an existing single-model deployment in place doesn't lose track of an already-running job.)
+
+If replacement jobs keep failing (dying at startup, never registering, or failing health checks), the gateway waits longer between them: 60 s after the first failure, doubling up to 30 minutes, until a health check passes. A cluster fault that kills every job therefore costs a couple of jobs per hour rather than one every few minutes.
 
 ## Development
 

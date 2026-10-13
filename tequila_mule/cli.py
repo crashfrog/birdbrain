@@ -45,6 +45,9 @@ class GatewayServer:
                 config.gateway.port,
                 self.gateway,
             )
+            # A passing health check ends the lifecycle's failed-job streak,
+            # resetting its resubmission backoff.
+            health_monitor.set_healthy_callback(lifecycle_manager.record_healthy)
 
             self.health_monitors[backend.name] = health_monitor
             self.lifecycle_managers[backend.name] = lifecycle_manager

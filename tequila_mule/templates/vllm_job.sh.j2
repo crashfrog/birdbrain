@@ -95,6 +95,28 @@ wait_healthy() {
     done
 }
 
+# Every planned port must be free before anything launches. A listener here
+# is almost always a vLLM from an earlier tequila-mule job on this node: one
+# still tearing down after scancel (wait it out), or one still running. In the
+# latter case our instance would die with "Address already in use" while
+# wait_healthy's localhost probe is answered by the other server, and this job
+# would register a backend it doesn't own — so fail instead.
+wait_ports_free() {
+    local port deadline=$((SECONDS + 60))
+    for port in "$@"; do
+        while (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; do
+            if [ "${SECONDS}" -ge "${deadline}" ]; then
+                echo "ERROR: port ${port} is already in use on $(hostname); another vLLM job may still be running here" >&2
+                return 1
+            fi
+            sleep 5
+        done
+    done
+}
+if ! wait_ports_free {% for inst in instances %}{{ inst.port }} {% endfor %}; then
+    exit 1
+fi
+
 {#
   Each instance runs in its own subshell so its environment never leaks into
   the next one. SINGULARITYENV_ crosses each variable into the container.

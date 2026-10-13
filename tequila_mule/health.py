@@ -35,10 +35,15 @@ class HealthMonitor:
         self.running = False
         self.task: Optional[asyncio.Task] = None
         self.on_unhealthy_callback: Optional[callable] = None
+        self.on_healthy_callback: Optional[callable] = None
 
     def set_unhealthy_callback(self, callback: callable) -> None:
         """Set callback to trigger on backend failure."""
         self.on_unhealthy_callback = callback
+
+    def set_healthy_callback(self, callback: callable) -> None:
+        """Set (sync) callback run after every check where all backends answer."""
+        self.on_healthy_callback = callback
 
     async def start(self) -> None:
         """Start health monitoring loop."""
@@ -103,6 +108,8 @@ class HealthMonitor:
                     logger.info(f"[{self.backend_name}] Backend recovered")
                 self.is_healthy = True
                 consecutive_failures = 0
+                if self.on_healthy_callback:
+                    self.on_healthy_callback()
             else:
                 consecutive_failures += 1
                 logger.warning(

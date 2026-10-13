@@ -1,6 +1,7 @@
 """Tests for lifecycle manager."""
 
 import json
+import subprocess
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -307,14 +308,144 @@ async def test_job_not_promoted_until_secondary_registers(mock_gateway, tmp_path
 @pytest.mark.asyncio
 async def test_cold_start_records_pending_job(mock_gateway, tmp_path):
     manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+
+    async def promote(job):
+        manager.current_job = job
+
     with patch.object(manager, "_submit_job", return_value="88"), \
-            patch.object(manager, "_wait_for_job_ready", AsyncMock()):
+            patch.object(manager, "_wait_for_job_ready", side_effect=promote):
         await manager._cold_start()
 
     reloaded = _colocated_manager(mock_gateway, tmp_path)
     reloaded._load_state()
     assert reloaded.pending_job.job_id == "88"
     assert reloaded.pending_job.expected_ports == [50001, 50002]
+
+
+def test_restart_delay_doubles_to_cap_and_resets_when_healthy(mock_gateway, tmp_path):
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    delays = []
+    for failures in range(8):
+        manager._consecutive_failures = failures
+        delays.append(manager._restart_delay())
+    assert delays == [0, 60, 120, 240, 480, 960, 1800, 1800]
+
+    manager.record_healthy()
+    assert manager._restart_delay() == 0
+
+
+@pytest.mark.asyncio
+async def test_cold_start_backs_off_and_resubmits_after_failed_job(mock_gateway, tmp_path):
+    """A replacement that never becomes current is followed by another one,
+    only after the backoff delay; prior failures lengthen the first wait."""
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+    manager._restart_in_progress = True
+    manager._consecutive_failures = 1  # e.g. the health monitor's restart
+
+    async def first_fails_second_registers(job):
+        if job.job_id == "2":
+            manager.current_job = job
+
+    sleep = AsyncMock()
+    with patch.object(manager, "_submit_job", side_effect=["1", "2"]), \
+            patch.object(manager, "_wait_for_job_ready", side_effect=first_fails_second_registers), \
+            patch("tequila_mule.lifecycle.asyncio.sleep", sleep):
+        await manager._cold_start()
+
+    assert [c.args[0] for c in sleep.call_args_list] == [60, 120]
+    assert manager.current_job.job_id == "2"
+    assert manager._restart_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_cold_start_retries_after_sbatch_failure(mock_gateway, tmp_path):
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+
+    async def promote(job):
+        manager.current_job = job
+
+    sbatch_error = subprocess.CalledProcessError(1, "sbatch", stderr=b"Unable to contact slurm controller")
+    sleep = AsyncMock()
+    with patch.object(manager, "_submit_job", side_effect=[sbatch_error, "9"]), \
+            patch.object(manager, "_wait_for_job_ready", side_effect=promote), \
+            patch("tequila_mule.lifecycle.asyncio.sleep", sleep):
+        await manager._cold_start()
+
+    assert [c.args[0] for c in sleep.call_args_list] == [60]
+    assert manager.current_job.job_id == "9"
+
+
+@pytest.mark.asyncio
+@patch("tequila_mule.lifecycle.subprocess.run")
+async def test_registration_timeout_cancels_running_job(mock_run, mock_gateway, tmp_path):
+    """A job that reaches RUNNING but never registers is scancelled, not left
+    holding its GPU and ports until wall time."""
+    mock_gateway.get_backend_urls_by_job = lambda name, job_id: []
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+    job = manager._record_pending_job("77")
+
+    t0 = datetime(2026, 10, 12, 8, 19)
+    fake_datetime = MagicMock()
+    fake_datetime.utcnow.side_effect = [t0, t0 + timedelta(minutes=21)]
+    with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g042"}), \
+            patch("tequila_mule.lifecycle.datetime", fake_datetime):
+        await manager._wait_for_job_ready(job)
+
+    assert job.status == "FAILED"
+    assert manager.current_job is None
+    mock_run.assert_any_call(["scancel", "77"], capture_output=True)
+
+
+def _job(job_id: str, status: str = "RUNNING") -> JobState:
+    return JobState(
+        job_id=job_id,
+        node="g042",
+        status=status,
+        submitted_at=datetime.utcnow().isoformat(),
+        expires_at=(datetime.utcnow() + timedelta(hours=40)).isoformat(),
+    )
+
+
+@pytest.mark.asyncio
+@patch("tequila_mule.lifecycle.subprocess.run")
+async def test_unhealthy_restart_cancels_current_and_pending_jobs(mock_run, mock_gateway, tmp_path):
+    """The replacement supersedes a queued rotation job too; dropping it from
+    state without scancel left it to start untracked on the same node."""
+    mock_gateway.clear_backend = AsyncMock()
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.current_job = _job("100")
+    manager.pending_job = _job("101", status="PENDING")
+
+    await manager.clear_backend_and_restart()
+
+    cancelled = [c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "scancel"]
+    assert cancelled == [["scancel", "100"], ["scancel", "101"]]
+    assert manager.pending_job is None
+    assert manager._consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+@patch("tequila_mule.lifecycle.subprocess.run")
+async def test_start_cancels_pending_job_from_previous_run(mock_run, mock_gateway, tmp_path):
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.current_job = _job("200")
+    manager.pending_job = _job("201", status="PENDING")
+    manager._save_state()
+
+    restarted = _colocated_manager(mock_gateway, tmp_path)
+    with patch.object(restarted, "_get_job_info", return_value={"state": "RUNNING", "node": "g042"}):
+        await restarted.start()
+        await restarted.stop()
+
+    mock_run.assert_any_call(["scancel", "201"], capture_output=True)
+    reloaded = _colocated_manager(mock_gateway, tmp_path)
+    reloaded._load_state()
+    assert reloaded.current_job.job_id == "200"
+    assert reloaded.pending_job is None
 
 
 @pytest.mark.asyncio
