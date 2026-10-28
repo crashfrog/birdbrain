@@ -25,9 +25,9 @@ def sample_config_data():
         },
         "paths": {
             "container_path": "/home/test/vllm.sif",
-            "job_template": "tequila_mule/templates/vllm_job.sh.j2",
-            "state_file": "~/.tequila-mule/state.json",
-            "log_dir": "~/.tequila-mule/logs",
+            "job_template": "birdbrain/templates/vllm_job.sh.j2",
+            "state_file": "~/.birdbrain/state.json",
+            "log_dir": "~/.birdbrain/logs",
         },
     }
 
@@ -76,8 +76,8 @@ def sample_multi_backend_config_data():
         ],
         "paths": {
             "container_path": "/home/test/vllm.sif",
-            "job_template": "tequila_mule/templates/vllm_job.sh.j2",
-            "state_file": "~/.tequila-mule/state.json",
-            "log_dir": "~/.tequila-mule/logs",
+            "job_template": "birdbrain/templates/vllm_job.sh.j2",
+            "state_file": "~/.birdbrain/state.json",
+            "log_dir": "~/.birdbrain/logs",
         },
     }

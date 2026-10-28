@@ -4,7 +4,7 @@
 {% endif %}{% if cpus_per_task %}#SBATCH --cpus-per-task={{ cpus_per_task }}
 {% endif %}#SBATCH --gres={{ gres }}
 #SBATCH --time={{ wall_time }}
-#SBATCH --job-name=tequila-mule-vllm
+#SBATCH --job-name=birdbrain-vllm
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-echo "=== tequila-mule vLLM Job ({{ instances | length }} instance(s)) ==="
+echo "=== birdbrain vLLM Job ({{ instances | length }} instance(s)) ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 echo "Started: $(date)"
@@ -96,7 +96,7 @@ wait_healthy() {
 }
 
 # Every planned port must be free before anything launches. A listener here
-# is almost always a vLLM from an earlier tequila-mule job on this node: one
+# is almost always a vLLM from an earlier birdbrain job on this node: one
 # still tearing down after scancel (wait it out), or one still running. In the
 # latter case our instance would die with "Address already in use" while
 # wait_healthy's localhost probe is answered by the other server, and this job

@@ -1,6 +1,6 @@
 # Issue Tracker: GitHub Issues
 
-Issues for tequila-mule are tracked in [GitHub Issues](https://github.com/crashfrog/tequila-mule/issues).
+Issues for birdbrain are tracked in [GitHub Issues](https://github.com/crashfrog/birdbrain/issues).
 
 ## Creating Issues
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from tequila_mule.keystore import KeyStore
+from birdbrain.keystore import KeyStore
 
 
 @pytest.fixture

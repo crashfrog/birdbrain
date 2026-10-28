@@ -40,7 +40,7 @@ class Gateway:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.app = FastAPI(title="tequila-mule", version="0.1.0")
+        self.app = FastAPI(title="birdbrain", version="0.1.0")
         self.backends: Dict[str, List[BackendEntry]] = {}  # keyed by backend pool name
         self.backend_lock = asyncio.Lock()
         self.client = httpx.AsyncClient(timeout=300.0)  # 5min for long completions
@@ -307,7 +307,7 @@ class Gateway:
                 "id": model_id,
                 "object": "model",
                 "created": created,
-                "owned_by": "tequila-mule",
+                "owned_by": "birdbrain",
                 "root": root,
                 "parent": None if model_id == root else root,
                 "permission": [

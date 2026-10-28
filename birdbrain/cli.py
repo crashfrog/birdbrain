@@ -140,7 +140,7 @@ def run_server(config: Config) -> None:
 @click.option("--config", type=click.Path(exists=True), help="Config file path")
 @click.pass_context
 def main(ctx: click.Context, config: Optional[str]) -> None:
-    """tequila-mule: OpenAI-compatible gateway for Slurm-scheduled vLLM."""
+    """birdbrain: OpenAI-compatible gateway for Slurm-scheduled vLLM."""
     config_path = Path(config) if config else None
     ctx.obj = load_config(config_path)
 
@@ -149,7 +149,7 @@ def main(ctx: click.Context, config: Optional[str]) -> None:
 @click.pass_obj
 def start(config: Config) -> None:
     """Start the gateway server."""
-    click.echo("Starting tequila-mule gateway...")
+    click.echo("Starting birdbrain gateway...")
     click.echo(f"Gateway: {config.gateway.host}:{config.gateway.port}")
     click.echo(f"Backends ({len(config.backends)}):")
     for backend in config.backends:
@@ -162,7 +162,7 @@ def start(config: Config) -> None:
     if keystore.has_keys():
         click.echo(f"Auth: ENABLED ({len(keystore.list_keys())} keys)")
     else:
-        click.echo("Auth: DISABLED (run 'tequila-mule add-key <email>' to enable)")
+        click.echo("Auth: DISABLED (run 'birdbrain add-key <email>' to enable)")
 
     run_server(config)
 
@@ -184,7 +184,7 @@ def status(config: Config) -> None:
         click.echo("No state file found. Gateway may not be running.")
         return
 
-    click.echo("=== tequila-mule Status ===")
+    click.echo("=== birdbrain Status ===")
 
     for state_file in state_files:
         name = Path(state_file).stem.removeprefix("state-")
@@ -221,8 +221,8 @@ def status(config: Config) -> None:
 @click.pass_obj
 def stop(config: Config) -> None:
     """Stop the gateway server."""
-    click.echo("Stopping tequila-mule...")
-    click.echo("(Use Ctrl+C in the terminal running 'tequila-mule start')")
+    click.echo("Stopping birdbrain...")
+    click.echo("(Use Ctrl+C in the terminal running 'birdbrain start')")
     # TODO: Implement graceful shutdown via signal or PID file
 
 
@@ -256,7 +256,7 @@ def list_keys(config: Config) -> None:
     keys = keystore.list_keys()
     if not keys:
         click.echo("No API keys configured.")
-        click.echo("Run 'tequila-mule add-key <email>' to create one.")
+        click.echo("Run 'birdbrain add-key <email>' to create one.")
         return
 
     click.echo(f"API Keys ({len(keys)} total):")

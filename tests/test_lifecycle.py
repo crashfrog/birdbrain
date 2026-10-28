@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tequila_mule.config import Config
-from tequila_mule.lifecycle import JobState, LifecycleManager
+from birdbrain.config import Config
+from birdbrain.lifecycle import JobState, LifecycleManager
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def lifecycle_manager(mock_gateway, tmp_path):
     """Create lifecycle manager with temp state file."""
     config = Config()
     config.paths.state_file = str(tmp_path / "state.json")
-    config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
+    config.paths.job_template = "birdbrain/templates/vllm_job.sh.j2"
 
     backend_config = config.backends[0]
     manager = LifecycleManager(
@@ -96,7 +96,7 @@ def test_two_managers_do_not_share_state(mock_gateway, tmp_path):
     per-backend state files and not clobber each other's state."""
     config = Config()
     config.paths.state_file = str(tmp_path / "state.json")
-    config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
+    config.paths.job_template = "birdbrain/templates/vllm_job.sh.j2"
 
     backend_a = config.backends[0].model_copy(update={"name": "backend-a"})
     backend_b = config.backends[0].model_copy(update={"name": "backend-b"})
@@ -144,7 +144,7 @@ def test_legacy_state_file_migration(mock_gateway, tmp_path):
     upgrade doesn't lose track of an already-running job."""
     config = Config()
     config.paths.state_file = str(tmp_path / "state.json")
-    config.paths.job_template = "tequila_mule/templates/vllm_job.sh.j2"
+    config.paths.job_template = "birdbrain/templates/vllm_job.sh.j2"
 
     legacy_manager = LifecycleManager(
         config.backends[0], config.paths, "gw-host", 8765, mock_gateway
@@ -186,7 +186,7 @@ def test_legacy_state_file_migration(mock_gateway, tmp_path):
     assert new_manager.current_job.registered_backends == {"default": ["http://g999:50000"]}
 
 
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 def test_submit_job(mock_subprocess_run, lifecycle_manager):
     """Test job submission."""
     # Mock sbatch response
@@ -205,7 +205,7 @@ def test_submit_job(mock_subprocess_run, lifecycle_manager):
     assert call_args[0][0] == ["sbatch", "--parsable"]
 
 
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 def test_get_job_info(mock_subprocess_run, lifecycle_manager):
     """Test querying job info from squeue."""
     # Mock squeue response
@@ -221,7 +221,7 @@ def test_get_job_info(mock_subprocess_run, lifecycle_manager):
     assert info["node"] == "gpu-node-01"
 
 
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 def test_get_job_info_pending(mock_subprocess_run, lifecycle_manager):
     """Test job info for pending job (no node allocated yet)."""
     mock_subprocess_run.return_value = MagicMock(
@@ -236,7 +236,7 @@ def test_get_job_info_pending(mock_subprocess_run, lifecycle_manager):
     assert info["node"] is None
 
 
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 def test_get_job_info_not_found(mock_subprocess_run, lifecycle_manager):
     """Test job info when job no longer in queue."""
     mock_subprocess_run.return_value = MagicMock(
@@ -295,7 +295,7 @@ async def test_job_not_promoted_until_secondary_registers(mock_gateway, tmp_path
         registry["nomic-embed"] = ["http://g043:50002"]
 
     with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
-            patch("tequila_mule.lifecycle.asyncio.sleep", side_effect=register_sidecar):
+            patch("birdbrain.lifecycle.asyncio.sleep", side_effect=register_sidecar):
         await manager._wait_for_job_ready(job)
 
     assert manager.current_job is job
@@ -351,7 +351,7 @@ async def test_cold_start_backs_off_and_resubmits_after_failed_job(mock_gateway,
     sleep = AsyncMock()
     with patch.object(manager, "_submit_job", side_effect=["1", "2"]), \
             patch.object(manager, "_wait_for_job_ready", side_effect=first_fails_second_registers), \
-            patch("tequila_mule.lifecycle.asyncio.sleep", sleep):
+            patch("birdbrain.lifecycle.asyncio.sleep", sleep):
         await manager._cold_start()
 
     assert [c.args[0] for c in sleep.call_args_list] == [60, 120]
@@ -371,7 +371,7 @@ async def test_cold_start_retries_after_sbatch_failure(mock_gateway, tmp_path):
     sleep = AsyncMock()
     with patch.object(manager, "_submit_job", side_effect=[sbatch_error, "9"]), \
             patch.object(manager, "_wait_for_job_ready", side_effect=promote), \
-            patch("tequila_mule.lifecycle.asyncio.sleep", sleep):
+            patch("birdbrain.lifecycle.asyncio.sleep", sleep):
         await manager._cold_start()
 
     assert [c.args[0] for c in sleep.call_args_list] == [60]
@@ -379,7 +379,7 @@ async def test_cold_start_retries_after_sbatch_failure(mock_gateway, tmp_path):
 
 
 @pytest.mark.asyncio
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 async def test_registration_timeout_cancels_running_job(mock_run, mock_gateway, tmp_path):
     """A job that reaches RUNNING but never registers is scancelled, not left
     holding its GPU and ports until wall time."""
@@ -392,7 +392,7 @@ async def test_registration_timeout_cancels_running_job(mock_run, mock_gateway, 
     fake_datetime = MagicMock()
     fake_datetime.utcnow.side_effect = [t0, t0 + timedelta(minutes=21)]
     with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g042"}), \
-            patch("tequila_mule.lifecycle.datetime", fake_datetime):
+            patch("birdbrain.lifecycle.datetime", fake_datetime):
         await manager._wait_for_job_ready(job)
 
     assert job.status == "FAILED"
@@ -411,7 +411,7 @@ def _job(job_id: str, status: str = "RUNNING") -> JobState:
 
 
 @pytest.mark.asyncio
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 async def test_unhealthy_restart_cancels_current_and_pending_jobs(mock_run, mock_gateway, tmp_path):
     """The replacement supersedes a queued rotation job too; dropping it from
     state without scancel left it to start untracked on the same node."""
@@ -429,7 +429,7 @@ async def test_unhealthy_restart_cancels_current_and_pending_jobs(mock_run, mock
 
 
 @pytest.mark.asyncio
-@patch("tequila_mule.lifecycle.subprocess.run")
+@patch("birdbrain.lifecycle.subprocess.run")
 async def test_start_cancels_pending_job_from_previous_run(mock_run, mock_gateway, tmp_path):
     manager = _colocated_manager(mock_gateway, tmp_path)
     manager.current_job = _job("200")

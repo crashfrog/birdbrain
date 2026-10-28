@@ -1,5 +1,5 @@
-# tequila-mule configuration
-# Copy to ~/.tequila-mule/tequila-mule.toml and customize
+# birdbrain configuration
+# Copy to ~/.birdbrain/birdbrain.toml and customize
 #
 # Two supported shapes:
 #   1. Legacy single-model shape: top-level [slurm] + [model] tables.
@@ -13,14 +13,14 @@
 [gateway]
 host = "127.0.0.1"
 port = 8765
-# Auth is enabled via API keys. Run: tequila-mule add-key <email>
+# Auth is enabled via API keys. Run: birdbrain add-key <email>
 
 [paths]
-container_path = "~/.tequila-mule/containers/vllm-openai.sif"
-job_template = "tequila_mule/templates/vllm_job.sh.j2"
-state_file = "~/.tequila-mule/state.json"
-log_dir = "~/.tequila-mule/logs"
-api_keys_file = "~/.tequila-mule/api_keys.json"
+container_path = "~/.birdbrain/containers/vllm-openai.sif"
+job_template = "birdbrain/templates/vllm_job.sh.j2"
+state_file = "~/.birdbrain/state.json"
+log_dir = "~/.birdbrain/logs"
+api_keys_file = "~/.birdbrain/api_keys.json"
 
 # --- Legacy single-model shape (still supported) ---
 # [slurm]

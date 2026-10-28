@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from tequila_mule.config import BackendPoolConfig, Config, load_config
+from birdbrain.config import BackendPoolConfig, Config, load_config
 
 
 def test_config_defaults():
@@ -24,7 +24,7 @@ def test_config_defaults():
     assert default_backend.slurm.lead_time_minutes == 90
     assert default_backend.model.name == "meta-llama/Llama-3.1-8B"
 
-    assert config.paths.api_keys_file == "~/.tequila-mule/api_keys.json"
+    assert config.paths.api_keys_file == "~/.birdbrain/api_keys.json"
 
 
 def test_config_from_dict(sample_config_data):
@@ -139,7 +139,7 @@ def test_secondary_backend_name_colliding_with_pool_rejected(sample_multi_backen
 
 def test_wall_time_validation():
     """Test wall_time format validation."""
-    from tequila_mule.config import SlurmConfig
+    from birdbrain.config import SlurmConfig
 
     # Valid formats
     SlurmConfig(wall_time="23:00:00")

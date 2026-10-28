@@ -7,8 +7,8 @@ import respx
 from fastapi.testclient import TestClient
 from httpx import Response as HttpxResponse
 
-from tequila_mule.config import Config
-from tequila_mule.gateway import BackendEntry, Gateway
+from birdbrain.config import Config
+from birdbrain.gateway import BackendEntry, Gateway
 
 
 @pytest.fixture

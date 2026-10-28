@@ -1,6 +1,6 @@
 # Triage Labels
 
-Canonical label vocabulary for tequila-mule GitHub Issues.
+Canonical label vocabulary for birdbrain GitHub Issues.
 
 | Label | Meaning | Next Action |
 |-------|---------|-------------|

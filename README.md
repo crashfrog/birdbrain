@@ -1,18 +1,18 @@
-# tequila-mule
+# birdbrain
 
 An OpenAI-compatible gateway service that provides stable, continuous inference API access backed by dynamically scheduled LLM jobs on Slurm-managed HPC clusters.
 
 ## Overview
 
-**tequila-mule** solves a specific problem: on HPC systems with strict wall-time limits and no dedicated service infrastructure, how do you provide a persistent inference endpoint?
+**birdbrain** solves a specific problem: on HPC systems with strict wall-time limits and no dedicated service infrastructure, how do you provide a persistent inference endpoint?
 
 The answer: run overlapping rolling vLLM job reservations on the cluster, and have a lightweight gateway on the login node that automatically rotates to a new backend before the current job is killed by the scheduler. Clients never see a gap.
 
 ### Why not just use Ollama?
 
-Ollama and vLLM solve a different problem than tequila-mule does. Ollama gives you an OpenAI-compatible API and model serving, same as vLLM — but it has no concept of Slurm, job wall-time, or backend rotation, and its multi-GPU support is layer-splitting (like llama.cpp), not true tensor parallelism, so it can't match vLLM's throughput for large models split across multiple GPUs (e.g. `--tensor-parallel-size 2`). It also has no multi-user API key management.
+Ollama and vLLM solve a different problem than birdbrain does. Ollama gives you an OpenAI-compatible API and model serving, same as vLLM — but it has no concept of Slurm, job wall-time, or backend rotation, and its multi-GPU support is layer-splitting (like llama.cpp), not true tensor parallelism, so it can't match vLLM's throughput for large models split across multiple GPUs (e.g. `--tensor-parallel-size 2`). It also has no multi-user API key management.
 
-tequila-mule's value is the scheduling/rotation glue *around* a serving engine (Slurm job submission, lead-time rotation, health-checked failover, API keystore) — swapping the backend from vLLM to Ollama wouldn't remove any of that code, and would cost you tensor parallelism on multi-GPU jobs.
+birdbrain's value is the scheduling/rotation glue *around* a serving engine (Slurm job submission, lead-time rotation, health-checked failover, API keystore) — swapping the backend from vLLM to Ollama wouldn't remove any of that code, and would cost you tensor parallelism on multi-GPU jobs.
 
 ## Features
 
@@ -25,7 +25,7 @@ tequila-mule's value is the scheduling/rotation glue *around* a serving engine (
 
 ### Multi-model routing
 
-A gateway instance can manage any number of backend pools, each with its own Slurm sizing, model, and rotation timeline. Configure them as `[[backends]]` entries in the TOML (see `tequila-mule.toml`):
+A gateway instance can manage any number of backend pools, each with its own Slurm sizing, model, and rotation timeline. Configure them as `[[backends]]` entries in the TOML (see `birdbrain.toml`):
 
 ```toml
 [[backends]]
@@ -65,7 +65,7 @@ A pool can run more than one vLLM server inside its single Slurm job:
 - `replicas = N` (under `[backends.slurm]`) launches N copies of the pool's model. The job's GPUs are split evenly between them and the gateway round-robins requests across the copies. If one copy dies, the rest keep serving.
 - `[[backends.secondary_models]]` adds a different model to the same job, pinned to one of its GPUs and served under its own `backend_name`/aliases. This is meant for small sidecars, e.g. an embedding model next to a chat model, called through `POST /v1/embeddings`. Because a sidecar shares its pool's job, it is rotated with that job, and restarting a dead sidecar means restarting the whole job.
 
-Instances use consecutive ports starting at `slurm.port`, and two pools' port ranges must not overlap. A co-located model shares VRAM with the primary, so the two `--gpu-memory-utilization` values must add up to less than 1.0. See the commented examples in `tequila-mule.toml`.
+Instances use consecutive ports starting at `slurm.port`, and two pools' port ranges must not overlap. A co-located model shares VRAM with the primary, so the two `--gpu-memory-utilization` values must add up to less than 1.0. See the commented examples in `birdbrain.toml`.
 
 ## Quick Start
 
@@ -80,9 +80,9 @@ Instances use consecutive ports starting at `slurm.port`, and two pools' port ra
 ### Installation
 
 ```bash
-pip install tequila-mule
+pip install birdbrain
 # or with uv
-uv pip install tequila-mule
+uv pip install birdbrain
 ```
 
 ### Configuration
@@ -90,9 +90,9 @@ uv pip install tequila-mule
 Copy the example config and customize for your cluster:
 
 ```bash
-mkdir -p ~/.tequila-mule
-cp tequila-mule.toml ~/.tequila-mule/
-# Edit ~/.tequila-mule/tequila-mule.toml with your partition, wall-time, model, etc.
+mkdir -p ~/.birdbrain
+cp birdbrain.toml ~/.birdbrain/
+# Edit ~/.birdbrain/birdbrain.toml with your partition, wall-time, model, etc.
 ```
 
 ### First-Time Setup (air-gapped clusters)
@@ -109,27 +109,27 @@ pip install --user huggingface-cli
 huggingface-cli download meta-llama/Llama-3.1-8B
 ```
 
-Update config paths to match your environment (see `tequila-mule.toml`).
+Update config paths to match your environment (see `birdbrain.toml`).
 
 ### Running
 
 Generate API key (recommended):
 
 ```bash
-tequila-mule add-key your.email@example.com
+birdbrain add-key your.email@example.com
 # Save the generated key for client configuration
 ```
 
 Start the gateway:
 
 ```bash
-tequila-mule start
+birdbrain start
 ```
 
 This will submit the first vLLM job and enter a holding pattern (`503 Retry-After`) until the backend is ready. Check status in another terminal:
 
 ```bash
-tequila-mule status
+birdbrain status
 ```
 
 Once the backend is warm, the gateway accepts requests at `http://localhost:8765` (configurable).
@@ -138,7 +138,7 @@ Test it:
 
 ```bash
 # Get your API key (use email from add-key command)
-export OPENAI_API_KEY=$(tequila-mule show-key your.email@example.com | grep -o 'sk-[^ ]*')
+export OPENAI_API_KEY=$(birdbrain show-key your.email@example.com | grep -o 'sk-[^ ]*')
 
 curl -X POST http://localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -153,15 +153,15 @@ curl -X POST http://localhost:8765/v1/chat/completions \
 ### Command Reference
 
 ```bash
-tequila-mule start                  # Start the gateway (foreground)
-tequila-mule status                 # Show current backend, job IDs, health
-tequila-mule stop                   # Graceful shutdown (Ctrl+C in start terminal)
+birdbrain start                  # Start the gateway (foreground)
+birdbrain status                 # Show current backend, job IDs, health
+birdbrain stop                   # Graceful shutdown (Ctrl+C in start terminal)
 
 # API key management
-tequila-mule add-key <email>        # Create API key for user
-tequila-mule list-keys              # List all API keys
-tequila-mule show-key [email]       # Show key for email (or all keys)
-tequila-mule revoke-key <key|email> # Revoke API key
+birdbrain add-key <email>        # Create API key for user
+birdbrain list-keys              # List all API keys
+birdbrain show-key [email]       # Show key for email (or all keys)
+birdbrain revoke-key <key|email> # Revoke API key
 ```
 
 ## Architecture
@@ -176,7 +176,7 @@ See [CLAUDE.md](CLAUDE.md) for detailed architecture and development notes.
 
 ## Configuration
 
-See `tequila-mule.toml` for all options. Key sections:
+See `birdbrain.toml` for all options. Key sections:
 
 - `[gateway]` — host, port, request retry window
 - `[[backends]]` — one entry per model pool; each has its own `[backends.slurm]` (partition, GPU request, wall-time, lead-time, port) and `[backends.model]` (model name, vLLM arguments), plus an `aliases` list
@@ -188,7 +188,7 @@ Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still suppor
 
 **Deploying on a new cluster?** Start with **[AGENTS.md](AGENTS.md)** — a
 cluster-agnostic deployment guide written for an agent or engineer bringing
-tequila-mule up on a grid it wasn't built for. It walks the filesystem/bind-mount,
+birdbrain up on a grid it wasn't built for. It walks the filesystem/bind-mount,
 container-version, model-fit, and connectivity gotchas in order, with a
 failure→cause quick reference. (Site operators may keep a private,
 cluster-specific companion doc with already-solved values for their own grid;
@@ -197,10 +197,10 @@ such files are gitignored and not part of this public repo.)
 For production, use `nohup` or systemd user unit:
 
 ```bash
-nohup tequila-mule start > ~/.tequila-mule/logs/gateway.log 2>&1 &
+nohup birdbrain start > ~/.birdbrain/logs/gateway.log 2>&1 &
 ```
 
-The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates each backend pool's job state from its own `~/.tequila-mule/state-<pool-name>.json` and resumes normal operation; a rotation job that was still pending is cancelled and resubmitted. (A pool named `"default"` — the legacy single-model shape — falls back to the older `~/.tequila-mule/state.json` if its own state file doesn't exist yet, so upgrading an existing single-model deployment in place doesn't lose track of an already-running job.)
+The gateway is designed to run as a persistent process on the login node. On restart, it rehydrates each backend pool's job state from its own `~/.birdbrain/state-<pool-name>.json` and resumes normal operation; a rotation job that was still pending is cancelled and resubmitted. (A pool named `"default"` — the legacy single-model shape — falls back to the older `~/.birdbrain/state.json` if its own state file doesn't exist yet, so upgrading an existing single-model deployment in place doesn't lose track of an already-running job.)
 
 If replacement jobs keep failing (dying at startup, never registering, or failing health checks), the gateway waits longer between them: 60 s after the first failure, doubling up to 30 minutes, until a health check passes. A cluster fault that kills every job therefore costs a couple of jobs per hour rather than one every few minutes.
 
@@ -216,8 +216,8 @@ pip install -e ".[dev]"
 pytest
 
 # Run type checking and linting
-mypy tequila_mule/
-ruff check tequila_mule/
+mypy birdbrain/
+ruff check birdbrain/
 ```
 
 ## Limitations (v1)
@@ -229,7 +229,7 @@ ruff check tequila_mule/
 
 ## Support
 
-For issues, feature requests, or contributions, see the [GitHub repository](https://github.com/crashfrog/tequila-mule).
+For issues, feature requests, or contributions, see the [GitHub repository](https://github.com/crashfrog/birdbrain).
 
 ---
 

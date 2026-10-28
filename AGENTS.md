@@ -1,6 +1,6 @@
-# AGENTS.md — Deploying tequila-mule on a new HPC cluster
+# AGENTS.md — Deploying birdbrain on a new HPC cluster
 
-This guide is for an **agent (or engineer) deploying tequila-mule on a grid other
+This guide is for an **agent (or engineer) deploying birdbrain on a grid other
 than the one it was first built for**. It captures the cluster-specific gotchas
 that are *not* visible from the code and that will otherwise be rediscovered the
 hard way, one failed Slurm job at a time.
@@ -19,7 +19,7 @@ see `README.md`.
 
 ## The mental model in one paragraph
 
-tequila-mule runs a FastAPI gateway on a **login node**. It submits vLLM jobs to
+birdbrain runs a FastAPI gateway on a **login node**. It submits vLLM jobs to
 **compute nodes** via Slurm, waits for each job to register back, and rotates
 backends before Slurm kills them. Almost every deployment failure is one of:
 (1) the compute node can't see the files the login node can, (2) the container's
@@ -70,7 +70,7 @@ container live on `/nfs/...` (or any non-default mount), the container will repo
 OSError: Incorrect path_or_model_id: '/nfs/scratch/.../model'
 ```
 
-The job template (`tequila_mule/templates/vllm_job.sh.j2`) already passes
+The job template (`birdbrain/templates/vllm_job.sh.j2`) already passes
 `--bind {{ bind_path | default('/nfs') }}`. **If your scratch is not under `/nfs`,
 you must change the bind path** — either edit the default in the template, or (once
 wired through) supply `bind_path` at render time in `lifecycle.py`. Confirm with:
@@ -228,5 +228,5 @@ start the gateway.
 | `illegal memory access` at "Capturing CUDA graphs" | graph capture unstable on this GPU topology | `--disable-custom-all-reduce`, then `--enforce-eager` (step 5) |
 | Job RUNNING but gateway never flips to it | compute node can't reach login-node gateway port | fix connectivity or use polling fallback (step 6) |
 | Jobs register, then are cancelled as unhealthy minutes later, over and over; `unreachable: All connection attempts failed` in `gateway.log` | login node can't reach the compute node (check `ip neigh` / `curl http://<node>:<port>/health` from the login node; `No route to host` = network fault) | cluster admins; the gateway backs off resubmission (up to 30 min) until a health check passes (step 6) |
-| Job log shows `port … is already in use` and exits | a vLLM from another job still holds the port on that node | `squeue -u $USER` for an untracked `tequila-mule-vllm` job on that node; `scancel` it |
+| Job log shows `port … is already in use` and exits | a vLLM from another job still holds the port on that node | `squeue -u $USER` for an untracked `birdbrain-vllm` job on that node; `scancel` it |
 | Replacement job late; clients see a gap | `lead_time_minutes` < queue wait | raise `lead_time_minutes` (step 7) |

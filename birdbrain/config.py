@@ -125,11 +125,11 @@ class BackendPoolConfig(BaseModel):
 class PathsConfig(BaseModel):
     """Path configuration."""
 
-    container_path: str = "~/.tequila-mule/containers/vllm-openai.sif"
-    job_template: str = "tequila_mule/templates/vllm_job.sh.j2"
-    state_file: str = "~/.tequila-mule/state.json"
-    log_dir: str = "~/.tequila-mule/logs"
-    api_keys_file: str = "~/.tequila-mule/api_keys.json"
+    container_path: str = "~/.birdbrain/containers/vllm-openai.sif"
+    job_template: str = "birdbrain/templates/vllm_job.sh.j2"
+    state_file: str = "~/.birdbrain/state.json"
+    log_dir: str = "~/.birdbrain/logs"
+    api_keys_file: str = "~/.birdbrain/api_keys.json"
 
 
 class Config(BaseModel):
@@ -198,8 +198,8 @@ def load_config(config_path: Optional[Path] = None) -> Config:
 
     Search order:
     1. Provided path
-    2. ./tequila-mule.toml
-    3. ~/.tequila-mule/tequila-mule.toml
+    2. ./birdbrain.toml
+    3. ~/.birdbrain/birdbrain.toml
 
     Returns default config if no file found.
     """
@@ -207,8 +207,8 @@ def load_config(config_path: Optional[Path] = None) -> Config:
         paths_to_try = [config_path]
     else:
         paths_to_try = [
-            Path("tequila-mule.toml"),
-            Path.home() / ".tequila-mule" / "tequila-mule.toml",
+            Path("birdbrain.toml"),
+            Path.home() / ".birdbrain" / "birdbrain.toml",
         ]
 
     for path in paths_to_try:

@@ -6,7 +6,7 @@ import pytest
 import respx
 from httpx import Response as HttpxResponse
 
-from tequila_mule.health import HealthMonitor
+from birdbrain.health import HealthMonitor
 
 
 def _monitor(registry: dict[str, list[str]]) -> HealthMonitor:

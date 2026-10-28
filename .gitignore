@@ -33,9 +33,9 @@ env/
 *.swo
 *~
 
-# tequila-mule specific
-~/.tequila-mule/
-.tequila-mule/
+# birdbrain specific
+~/.birdbrain/
+.birdbrain/
 state.json
 *.log
 
@@ -48,8 +48,8 @@ state.json
 # and paths — do not commit to the public repo)
 REEDLING.md
 REEDLING_DEPLOYMENT.md
-tequila-mule-reedling.toml
-tequila-mule-reedling-fixed.toml
+birdbrain-reedling.toml
+birdbrain-reedling-fixed.toml
 vllm_job_reedling.sh.j2
 deploy_to_reedling.sh
 finish_deployment.sh

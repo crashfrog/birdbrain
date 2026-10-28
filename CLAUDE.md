@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**tequila-mule** is a lightweight gateway service providing an OpenAI-compatible inference API backed by dynamically scheduled LLM jobs on a Slurm-managed HPC cluster. The system maintains continuous API availability by running overlapping rolling vLLM job reservations, automatically rotating to a new backend before the current job is killed by the scheduler.
+**birdbrain** is a lightweight gateway service providing an OpenAI-compatible inference API backed by dynamically scheduled LLM jobs on a Slurm-managed HPC cluster. The system maintains continuous API availability by running overlapping rolling vLLM job reservations, automatically rotating to a new backend before the current job is killed by the scheduler.
 
 **Key design constraint**: Operates entirely within user-level Slurm permissions on login nodes with no dedicated service infrastructure—simple enough for a single researcher to deploy.
 
-See `/tequila-mule-PRD.md` (or the PRD passed at init time) for full requirements.
+See `/birdbrain-PRD.md` (or the PRD passed at init time) for full requirements.
 
 ## Agent Skills
 
@@ -27,8 +27,8 @@ Single-context layout: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/ag
 ## Project Structure
 
 ```
-tequila-mule/
-├── tequila_mule/
+birdbrain/
+├── birdbrain/
 │   ├── __init__.py
 │   ├── gateway.py              # FastAPI app, OpenAI-compatible proxy
 │   ├── lifecycle.py            # Job submission & rotation logic
@@ -45,7 +45,7 @@ tequila-mule/
 │   ├── test_health.py
 │   └── test_config.py
 ├── pyproject.toml              # Dependencies & package metadata
-├── tequila-mule.toml           # Example config (user copies to ~/.tequila-mule/)
+├── birdbrain.toml           # Example config (user copies to ~/.birdbrain/)
 └── README.md                   # Installation & quickstart
 ```
 
@@ -116,7 +116,7 @@ pytest tests/test_gateway.py
 pytest tests/test_gateway.py::test_proxy_chat_completions
 
 # Run with coverage
-pytest --cov=tequila_mule tests/
+pytest --cov=birdbrain tests/
 
 # Run only integration tests (require Slurm mock)
 pytest -m integration
@@ -126,13 +126,13 @@ pytest -m integration
 
 ```bash
 # Format code
-ruff format tequila_mule/ tests/
+ruff format birdbrain/ tests/
 
 # Lint (includes import sorting)
-ruff check tequila_mule/ tests/ --fix
+ruff check birdbrain/ tests/ --fix
 
 # Type checking
-mypy tequila_mule/
+mypy birdbrain/
 
 # Run all checks (lint + type + tests)
 make check
@@ -141,25 +141,25 @@ make check
 ### Running Locally
 
 ```bash
-# Start gateway (reads tequila-mule.toml from CWD)
-tequila-mule start
+# Start gateway (reads birdbrain.toml from CWD)
+birdbrain start
 
 # Show current status
-tequila-mule status
+birdbrain status
 
 # Force manual rotation (testing)
-tequila-mule rotate
+birdbrain rotate
 
 # Tail logs
-tequila-mule logs
+birdbrain logs
 
 # Graceful shutdown
-tequila-mule stop
+birdbrain stop
 ```
 
 ### Config
 
-The gateway reads `tequila-mule.toml` from the current directory or `~/.tequila-mule/tequila-mule.toml`. Example values are in the repo; users copy and customize for their cluster.
+The gateway reads `birdbrain.toml` from the current directory or `~/.birdbrain/birdbrain.toml`. Example values are in the repo; users copy and customize for their cluster.
 
 Key config sections:
 - `[gateway]`: host, port, api_key, request_retry_window_seconds
@@ -170,13 +170,13 @@ Key config sections:
 ## Key Implementation Details
 
 ### State Persistence
-- Each backend pool's job state stored in its own `~/.tequila-mule/state-<pool-name>.json` (configurable base path)
-- A `"default"` pool (legacy single-model config) falls back to the old shared `~/.tequila-mule/state.json` if its per-pool file doesn't exist yet — zero-downtime migration path for existing deployments
+- Each backend pool's job state stored in its own `~/.birdbrain/state-<pool-name>.json` (configurable base path)
+- A `"default"` pool (legacy single-model config) falls back to the old shared `~/.birdbrain/state.json` if its per-pool file doesn't exist yet — zero-downtime migration path for existing deployments
 - On gateway restart, each pool's lifecycle manager independently re-checks `squeue` to rehydrate and validate
 - If a pool's job is dead, that pool cold-starts independently of the others
 
 ### Slurm Job Submission
-- Template: `tequila_mule/templates/vllm_job.sh.j2` (shared across all backend pools; differentiated purely by Jinja variables — gres, model, args, port, backend_name)
+- Template: `birdbrain/templates/vllm_job.sh.j2` (shared across all backend pools; differentiated purely by Jinja variables — gres, model, args, port, backend_name)
 - Rendered with live parameters (job_id, port, model, backend_name)
 - Job posts to gateway `/internal/register` once vLLM is accepting requests, including `backend_name` so the gateway knows which pool is registering
 - Before launching, the job waits up to 60 s for every planned port to be free on its node and exits non-zero otherwise, so a leftover vLLM from another job can't satisfy its localhost readiness probe
@@ -205,21 +205,21 @@ Key config sections:
 2. **Wall-time alignment**: `wall_time` config must match cluster policy; misalignment causes unexpected job kills
 3. **Lead time too short**: If `lead_time_minutes` is too small, new job may not reach RUNNING before current job expires
 4. **Shared filesystem**: vLLM model weights and Singularity container must be accessible from both login and compute nodes
-5. **API key management**: Each key tied to an email; use `tequila-mule add-key <email>` to create, tracks last_used timestamp
+5. **API key management**: Each key tied to an email; use `birdbrain add-key <email>` to create, tracks last_used timestamp
 6. **Air-gapped compute nodes**: Pre-download container and model weights on login node before first run
 
 ## Deployment Notes
 
 **Recommended invocation** (for production):
 ```bash
-nohup tequila-mule start > ~/.tequila-mule/logs/gateway.log 2>&1 &
+nohup birdbrain start > ~/.birdbrain/logs/gateway.log 2>&1 &
 ```
 
 Or as systemd user unit if environment supports `loginctl enable-linger`.
 
 **Monitoring**:
-- `tequila-mule status` shows current backend, job IDs, expiry times, health
-- Logs in `~/.tequila-mule/logs/` (configurable)
+- `birdbrain status` shows current backend, job IDs, expiry times, health
+- Logs in `~/.birdbrain/logs/` (configurable)
 - Health monitor probes are verbose in logs for troubleshooting
 
 ## Future Extensions (Out of Scope v1)
@@ -227,4 +227,4 @@ Or as systemd user unit if environment supports `loginctl enable-linger`.
 - SGE/PBS support (job submission abstraction is designed for swapping)
 - Dynamic/runtime alias re-pointing (aliases are currently static, fixed in TOML until restart — no Bedrock-style hot model-version swaps under a stable alias)
 - Autoscaling (submit additional jobs under load—natural extension of lifecycle manager)
-- Web dashboard (`tequila-mule status --web` for HTML status page)
+- Web dashboard (`birdbrain status --web` for HTML status page)

@@ -103,7 +103,7 @@ class LifecycleManager:
         self.jinja_env = Environment(loader=FileSystemLoader(template_dir))
         self.template_name = Path(paths.job_template).name
 
-        # Per-backend state file, e.g. ~/.tequila-mule/state-default.json
+        # Per-backend state file, e.g. ~/.birdbrain/state-default.json
         self.state_file = Path(paths.state_file).expanduser().with_name(
             f"state-{self.name}.json"
         )

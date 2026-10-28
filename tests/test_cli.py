@@ -1,7 +1,7 @@
 """Tests for CLI/gateway-server wiring."""
 
-from tequila_mule.cli import GatewayServer
-from tequila_mule.config import Config
+from birdbrain.cli import GatewayServer
+from birdbrain.config import Config
 
 
 def test_advertise_host_defaults_to_real_hostname_on_bind_all(monkeypatch):

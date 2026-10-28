@@ -1,6 +1,6 @@
 # Domain Docs: Single-Context Layout
 
-tequila-mule uses a single-context layout for domain documentation:
+birdbrain uses a single-context layout for domain documentation:
 
 - **`CONTEXT.md`** (repo root) — domain language, key concepts, architectural invariants
 - **`docs/adr/`** (repo root) — Architecture Decision Records
@@ -19,7 +19,7 @@ Skills that consume domain docs:
 Start with high-level project overview, domain terms, and architectural constraints. Example structure:
 
 ```markdown
-# tequila-mule Context
+# birdbrain Context
 
 ## Project Vision
 [1-2 sentences on why this exists]
