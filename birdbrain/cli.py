@@ -44,6 +44,7 @@ class GatewayServer:
                 self._advertise_host(config),
                 config.gateway.port,
                 self.gateway,
+                config.schedule,
             )
             # A passing health check ends the lifecycle's failed-job streak,
             # resetting its resubmission backoff.

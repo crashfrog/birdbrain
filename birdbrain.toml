@@ -140,3 +140,15 @@ vllm_extra_args = "--tensor-parallel-size 1 --max-model-len 8192 --enable-prefix
 #
 # [backends.secondary_models.env]
 # HF_HOME = "/scratch/you/hf-cache"
+
+# --- Optional: scheduled uptime/downtime ---
+# When [schedule] is present, all pool jobs are cancelled outside the daily
+# window and resubmitted when it opens, so GPUs are returned to other cluster
+# users while the gateway is idle. Times are wall-clock in `timezone` (IANA name;
+# default UTC). `days` lists the days windows *start* on (`mon`..`sun`); default
+# is every day. `stop` not after `start` wraps overnight.
+# [schedule]
+# timezone = "America/New_York"
+# start = "07:00"
+# stop  = "19:00"
+# days  = ["mon", "tue", "wed", "thu", "fri"]

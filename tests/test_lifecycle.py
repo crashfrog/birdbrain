@@ -1,46 +1,16 @@
 """Tests for lifecycle manager."""
-@pytest.mark.asyncio
-@patch("birdbrain.lifecycle.subprocess.run")
-async def test_promotion_cancels_replaced_job_and_counts_expiry_from_start(
-    mock_run, mock_gateway, tmp_path
-):
-    """A rotation replacement that registers scancels the job it replaces
-    (else it holds its GPUs untracked until wall time), and its expiry counts
-    from when it started running, not from when it was queued."""
-    mock_gateway.get_backend_urls_by_job = lambda name, job_id: (
-        ["http://g043:50001"] if name == "laguna-xs" else ["http://g043:50002"]
-    )
-    manager = _colocated_manager(mock_gateway, tmp_path)
-    manager.running = True
-    old = _job("100")
-    manager.current_job = old
-    job = manager._record_pending_job("101")
-    job.expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()  # stale queue-time estimate
-
-    t0 = datetime(2026, 11, 16, 12, 0)
-    fake_datetime = MagicMock()
-    fake_datetime.utcnow.return_value = t0
-    with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
-            patch("birdbrain.lifecycle.datetime", fake_datetime):
-        await manager._wait_for_job_ready(job)
-
-    assert manager.current_job is job
-    assert job.expires_at == (t0 + timedelta(hours=23)).isoformat()  # default wall_time
-    cancelled = [c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "scancel"]
-    assert cancelled == [["scancel", "100"]]
-
-
 
 import json
+import asyncio
+import datetime as dt
 import subprocess
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from birdbrain.config import Config
+from birdbrain.config import Config, ScheduleConfig
 from birdbrain.lifecycle import JobState, LifecycleManager
-
 
 @pytest.fixture
 def mock_gateway():
@@ -280,7 +250,7 @@ def test_get_job_info_not_found(mock_subprocess_run, lifecycle_manager):
     assert info is None
 
 
-def _colocated_manager(gateway, tmp_path, **slurm):
+def _colocated_manager(gateway, tmp_path, schedule=None, **slurm):
     config = Config(
         backends=[
             {
@@ -294,7 +264,7 @@ def _colocated_manager(gateway, tmp_path, **slurm):
         ]
     )
     config.paths.state_file = str(tmp_path / "state.json")
-    return LifecycleManager(config.backends[0], config.paths, "gw-host", 8765, gateway)
+    return LifecycleManager(config.backends[0], config.paths, "gw-host", 8765, gateway, schedule)
 
 
 def test_instance_plan_splits_gpus_between_replicas(mock_gateway, tmp_path):
@@ -431,6 +401,37 @@ async def test_registration_timeout_cancels_running_job(mock_run, mock_gateway, 
     mock_run.assert_any_call(["scancel", "77"], capture_output=True)
 
 
+@pytest.mark.asyncio
+@patch("birdbrain.lifecycle.subprocess.run")
+async def test_promotion_cancels_replaced_job_and_counts_expiry_from_start(
+    mock_run, mock_gateway, tmp_path
+):
+    """A rotation replacement that registers scancels the job it replaces
+    (else it holds its GPUs untracked until wall time), and its expiry counts
+    from when it started running, not from when it was queued."""
+    mock_gateway.get_backend_urls_by_job = lambda name, job_id: (
+        ["http://g043:50001"] if name == "laguna-xs" else ["http://g043:50002"]
+    )
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+    old = _job("100")
+    manager.current_job = old
+    job = manager._record_pending_job("101")
+    job.expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()  # stale queue-time estimate
+
+    t0 = datetime(2026, 11, 16, 12, 0)
+    fake_datetime = MagicMock()
+    fake_datetime.utcnow.return_value = t0
+    with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
+            patch("birdbrain.lifecycle.datetime", fake_datetime):
+        await manager._wait_for_job_ready(job)
+
+    assert manager.current_job is job
+    assert job.expires_at == (t0 + timedelta(hours=23)).isoformat()  # default wall_time
+    cancelled = [c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "scancel"]
+    assert cancelled == [["scancel", "100"]]
+
+
 def _job(job_id: str, status: str = "RUNNING") -> JobState:
     return JobState(
         job_id=job_id,
@@ -477,7 +478,45 @@ async def test_start_cancels_pending_job_from_previous_run(mock_run, mock_gatewa
     reloaded._load_state()
     assert reloaded.current_job.job_id == "200"
     assert reloaded.pending_job is None
+    assert reloaded.pending_job is None
 
+
+@pytest.mark.asyncio
+async def test_start_inside_window_cold_starts_and_restarts_suspended_flag(mock_gateway, tmp_path):
+    """No current job and the window open: start() schedules a cold start and
+    does not suspend."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager._suspended = True
+
+    cold_start_mock = AsyncMock(return_value=None)
+    rotation_mock = AsyncMock(return_value=None)
+    with patch.object(manager, "_is_active", return_value=True), \
+            patch.object(manager, "_cold_start", new=cold_start_mock), \
+            patch.object(manager, "_rotation_loop", new=rotation_mock):
+        await manager.start()
+        # start() is inside the window: not suspended, cold_start scheduled.
+        assert manager._restart_in_progress is True
+    await manager.stop()
+    assert cold_start_mock.called
+
+
+@pytest.mark.asyncio
+async def test_start_outside_window_stays_suspended(mock_gateway, tmp_path):
+    """No current job and outside the window: start() suspends and does not
+    cold-start (which would waste GPUs)."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager.current_job = None
+    with patch.object(manager, "_is_active", return_value=False):
+        await manager.start()
+        await asyncio.sleep(0)
+    assert manager._suspended is True
+    assert manager._restart_in_progress is False
+    assert manager.current_job is None
+    await manager.stop()
 
 @pytest.mark.asyncio
 async def test_start_rehydrates_every_registered_backend(mock_gateway, tmp_path):
@@ -507,3 +546,119 @@ async def test_start_rehydrates_every_registered_backend(mock_gateway, tmp_path)
         ("laguna-xs", "http://g043:50001", "/m/laguna-xs"),
         ("nomic-embed", "http://g043:50002", "/m/nomic"),
     }
+
+
+@pytest.mark.asyncio
+@patch("birdbrain.lifecycle.subprocess.run")
+async def test_scheduled_stop_cancels_jobs_and_clears_backends(mock_run, mock_gateway, tmp_path):
+    """When the window closes, _scheduled_stop cancels current and pending jobs
+    and clears their gateway registrations."""
+    mock_gateway.clear_backend = AsyncMock()
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager.current_job = _job("200")
+    manager.pending_job = _job("201", status="PENDING")
+    await manager._scheduled_stop()
+    cancelled = [c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "scancel"]
+    assert cancelled == [["scancel", "200"], ["scancel", "201"]]
+    assert manager.current_job is None
+    assert manager.pending_job is None
+    assert manager._suspended is True
+    assert mock_gateway.clear_backend.call_count == len(manager._backend_model_names())
+
+
+@pytest.mark.asyncio
+@patch("birdbrain.lifecycle.subprocess.run")
+async def test_scheduled_stop_aborts_cold_start_without_failure(mock_run, mock_gateway, tmp_path):
+    """A cold start already marked suspended (the window closed mid-flight) exits
+    cleanly: no failure charged, no replacement submitted."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager._restart_in_progress = True
+    manager._consecutive_failures = 0
+    manager._record_pending_job("77")
+    manager._suspended = True  # window already closed before cold start ran
+    with patch.object(manager, "_submit_pending_job") as submit:
+        await manager._cold_start()
+    assert manager._consecutive_failures == 0
+    assert manager._suspended is True
+    assert manager._restart_in_progress is False
+    assert not submit.called
+
+
+@pytest.mark.asyncio
+async def test_rotation_skipped_when_window_closes_before_expiry(mock_gateway, tmp_path):
+    """When the window closes before the current job expires, no replacement is
+    submitted; the stop cancels the running job anyway. Control case: when the
+    window outlives the job, a replacement IS submitted."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager.current_job = _job("200")
+    now = datetime.utcnow()
+
+    async def stop_after(_):
+        manager.running = False
+
+    async def run_pass(window_end_fn, expires, submit_return):
+        manager.current_job.expires_at = expires
+        manager._window_end = window_end_fn
+        manager.running = True
+        submit_mock = MagicMock(return_value=submit_return)
+        with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
+                patch.object(manager, "_is_active", return_value=True), \
+                patch.object(manager, "_submit_pending_job", submit_mock), \
+                patch.object(manager, "_wait_for_job_ready", new=AsyncMock()), \
+                patch("birdbrain.lifecycle.asyncio.sleep", side_effect=stop_after):
+            await manager._rotation_loop()
+        return submit_mock
+
+    # Skip: window closes (+2h) before the job expires (+12h) -> no submit.
+    submit = await run_pass(lambda: now + timedelta(hours=2), (now + timedelta(hours=12)).isoformat(), None)
+    assert not submit.called
+
+    # Control: window ends (+12h) after the job expires (+1h) -> submit.
+    manager.current_job = _job("200")
+    submit = await run_pass(lambda: now + timedelta(hours=12), (now + timedelta(hours=1)).isoformat(), _job("300", "PENDING"))
+    assert submit.called
+
+
+@pytest.mark.asyncio
+@patch("birdbrain.lifecycle.subprocess.run")
+async def test_cold_start_suspended_mid_wait_does_not_count_failure(mock_run, mock_gateway, tmp_path):
+    """A window closing while _wait_for_job_ready is blocked must not charge a
+    failed job or trigger the resubmission backoff."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager._consecutive_failures = 0
+    manager.current_job = None
+    manager._record_pending_job("77")
+
+    async def suspend_then_noop(_job):
+        manager._suspended = True
+        manager.pending_job = None
+
+    with patch.object(manager, "_is_active", return_value=False), \
+            patch.object(manager, "_wait_for_job_ready", side_effect=suspend_then_noop):
+        manager.running = True
+        await manager._cold_start()
+    assert manager._consecutive_failures == 0
+    assert manager._restart_in_progress is False
+    assert manager.pending_job is None
+
+@pytest.mark.asyncio
+async def test_unhealthy_restart_ignored_while_suspended(mock_gateway, tmp_path):
+    """A health-failure while suspended must not cold-start a replacement."""
+    manager = _colocated_manager(mock_gateway, tmp_path, schedule=ScheduleConfig(
+        timezone="UTC", start=dt.time(7), stop=dt.time(19)
+    ))
+    manager._suspended = True
+    manager.current_job = _job("200")
+    manager.pending_job = _job("201", status="PENDING")
+    started: list = []
+    with patch("birdbrain.lifecycle.asyncio.create_task", side_effect=lambda coro: started.append(coro) or asyncio.ensure_future(coro)):
+        await manager.clear_backend_and_restart()
+    assert started == []

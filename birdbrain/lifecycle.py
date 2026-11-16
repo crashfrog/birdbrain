@@ -1,16 +1,4 @@
 """Slurm job lifecycle management."""
-        # Slurm's wall-time clock starts now, not at submission: a job can sit
-        # queued for hours. Counting from submission would trigger the next
-        # rotation that much too early, overlapping jobs and holding GPUs.
-        job.expires_at = (
-            start_time + _parse_wall_time(self.backend_config.slurm.wall_time)
-        ).isoformat()
-                previous = self.current_job
-                if previous is not None and previous.job_id != job.job_id:
-                    # The gateway already routes to the new job; the old one
-                    # would otherwise keep its GPUs and ports untracked until
-                    # its wall time.
-                    self._cancel_job(previous, f"replaced by job {job.job_id}")
 
 import asyncio
 import json
@@ -24,7 +12,7 @@ from typing import Optional
 
 from jinja2 import Environment, FileSystemLoader
 
-from .config import BackendPoolConfig, PathsConfig
+from .config import BackendPoolConfig, PathsConfig, ScheduleConfig
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +76,7 @@ class LifecycleManager:
         gateway_host: str,
         gateway_port: int,
         gateway: "Gateway",  # type: ignore
+        schedule: Optional[ScheduleConfig] = None,
     ) -> None:
         self.name = backend_config.name
         self.backend_config = backend_config
@@ -109,6 +98,12 @@ class LifecycleManager:
         # Replacement jobs that failed in a row since the last passing health
         # check; drives the resubmission backoff (RESTART_BACKOFF_*).
         self._consecutive_failures: int = 0
+        # Optional service window; when None the backend runs around the clock.
+        self.schedule = schedule
+        # True when we are outside the configured window and have cancelled
+        # jobs so they release their GPUs. Cold starts and health-monitor
+        # restarts are suppressed while True.
+        self._suspended: bool = False
 
         # Setup Jinja2 for job template rendering
         template_dir = Path(paths.job_template).parent
@@ -315,6 +310,34 @@ class LifecycleManager:
             )
         self._consecutive_failures = 0
 
+    def _is_active(self) -> bool:
+        """True when now is within the configured service window. No schedule
+        means the backend is always active."""
+        if self.schedule is None:
+            return True
+        return self.schedule.is_active(datetime.utcnow())
+
+    def _window_end(self) -> Optional[datetime]:
+        """Stop time of the current service window, or None when there is no
+        schedule or now is outside every window."""
+        if self.schedule is None:
+            return None
+        return self.schedule.window_end(datetime.utcnow())
+
+    async def _scheduled_stop(self) -> None:
+        """Cancel every job for this pool and suspend lifecycle actions until
+        the next service window opens."""
+        logger.info(f"[{self.name}] Service window closed; suspending backend")
+        self._suspended = True
+        await self._clear_gateway_backends()
+        if self.current_job:
+            self._cancel_job(self.current_job, "service window closed")
+            self.current_job = None
+        if self.pending_job:
+            self._cancel_job(self.pending_job, "service window closed")
+            self.pending_job = None
+        self._save_state()
+
     def _submit_pending_job(self) -> Optional[JobState]:
         """Submit and track a job. An sbatch failure counts toward the backoff
         and returns None: slurmctld can be unreachable during the same network
@@ -365,8 +388,12 @@ class LifecycleManager:
         # Run as a background task so uvicorn finishes startup and can
         # accept the /internal/register callback from the compute node.
         if not self.current_job:
-            self._restart_in_progress = True
-            asyncio.create_task(self._cold_start())
+            if not self._is_active():
+                self._suspended = True
+                logger.info(f"[{self.name}] Starting outside the service window; staying suspended")
+            else:
+                self._restart_in_progress = True
+                asyncio.create_task(self._cold_start())
 
         self.task = asyncio.create_task(self._rotation_loop())
         logger.info(f"[{self.name}] Lifecycle manager started")
@@ -407,6 +434,13 @@ class LifecycleManager:
         """
         try:
             while self.running:
+                if self._suspended:
+                    # The service window closed while we were waiting in the
+                    # backoff, so the current attempt would be wasted. Stop
+                    # without counting it as a failure.
+                    self.pending_job = None
+                    self._save_state()
+                    return
                 delay = self._restart_delay()
                 if delay:
                     logger.warning(
@@ -421,6 +455,12 @@ class LifecycleManager:
                 if job is None:
                     continue
                 await self._wait_for_job_ready(job)
+                if self._suspended:
+                    # The window closed while waiting for the job to register.
+                    # Don't charge this as a failed job or start the backoff.
+                    self.pending_job = None
+                    self._save_state()
+                    return
                 if self.current_job is job:
                     return
                 self._consecutive_failures += 1
@@ -444,7 +484,10 @@ class LifecycleManager:
                 job.status = "FAILED"
                 self._save_state()
                 return
-
+            if self._suspended:
+                # The window closed mid-wait; the rotation loop already handled
+                # the stop. Don't let this wait hang until the 20-minute deadline.
+                return
             if info["state"] == "RUNNING":
                 job.status = "RUNNING"
                 job.node = info["node"]
@@ -458,7 +501,16 @@ class LifecycleManager:
         # capture can take ~15 min on a cold compile cache. 20 min matches the
         # job template's startup deadline, which covers every instance.
         start_time = datetime.utcnow()
+        # Slurm's wall-time clock starts now, not at submission: a job can sit
+        # queued for hours. Counting from submission would trigger the next
+        # rotation that much too early, overlapping jobs and holding GPUs.
+        job.expires_at = (
+            start_time + _parse_wall_time(self.backend_config.slurm.wall_time)
+        ).isoformat()
         while self.running:
+            if self._suspended:
+                # Window closed mid-wait; the rotation loop handled the stop.
+                return
             if (datetime.utcnow() - start_time).total_seconds() > 1200:
                 logger.error(f"[{self.name}] Job {job.job_id} failed to register within 20 minutes")
                 # Still RUNNING in Slurm: left alone it would hold its GPUs and
@@ -478,7 +530,13 @@ class LifecycleManager:
             if all(len(registered[name]) >= count for name, count in expected.items()):
                 logger.info(f"[{self.name}] Job {job.job_id} registered all instances: {registered}")
                 job.registered_backends = registered
+                previous = self.current_job
                 self.current_job = job
+                if previous is not None and previous.job_id != job.job_id:
+                    # The gateway already routes to the new job; the old one
+                    # would otherwise keep its GPUs and ports untracked until
+                    # its wall time.
+                    self._cancel_job(previous, f"replaced by job {job.job_id}")
                 self.pending_job = None
                 self._save_state()
                 self._squeue_fail_count = 0
@@ -500,6 +558,9 @@ class LifecycleManager:
         lead_time), leaving clients with 503s the entire time.
         """
         logger.warning(f"[{self.name}] Health monitor reports backend unhealthy, triggering restart")
+        if self._suspended:
+            logger.debug(f"[{self.name}] Backend unhealthy while suspended; not restarting")
+            return
         if self._restart_in_progress:
             logger.warning(f"[{self.name}] Restart already in progress, skipping")
             return
@@ -523,6 +584,22 @@ class LifecycleManager:
     async def _rotation_loop(self) -> None:
         """Main rotation loop."""
         while self.running:
+            # Outside the service window, release the GPUs.
+            if not self._is_active():
+                if not self._suspended:
+                    self._suspended = True
+                    await self._scheduled_stop()
+                await asyncio.sleep(30)
+                continue
+            # Inside the window: clear the suspended flag and cold-start if we
+            # don't have a current job (e.g. the window just opened).
+            if self._suspended:
+                self._suspended = False
+                self._consecutive_failures = 0
+                if not self._restart_in_progress and not self.current_job:
+                    self._restart_in_progress = True
+                    asyncio.create_task(self._cold_start())
+
             if not self.current_job:
                 await asyncio.sleep(10)
                 continue
@@ -560,13 +637,22 @@ class LifecycleManager:
             else:
                 # Reset counter on success
                 self._squeue_fail_count = 0
-            # Calculate time until rotation needed
+            # Don't start a rotation whose replacement would outlive the current
+            # window. If the window closes before the current job expires, the
+            # scheduled stop will cancel that job anyway, so spinning up a
+            # replacement now (which would expire after the stop) is wasted work
+            # and contends for GPUs. Hold off until the stop clears jobs.
+            window_end = self._window_end()
             expires_at = datetime.fromisoformat(self.current_job.expires_at)
-            lead_time = timedelta(minutes=self.backend_config.slurm.lead_time_minutes)
-            rotation_time = expires_at - lead_time
+            if window_end and window_end <= expires_at:
+                await asyncio.sleep(30)
+                continue
+            rotation_time = expires_at - timedelta(
+                minutes=self.backend_config.slurm.lead_time_minutes
+            )
 
             now = datetime.utcnow()
-            if now >= rotation_time and not self.pending_job:
+            if now >= rotation_time and not self.pending_job and not self._suspended:
                 # Submit next job
                 logger.info(f"[{self.name}] Rotation window reached, submitting next job")
 
@@ -587,3 +673,4 @@ class LifecycleManager:
                     await asyncio.sleep(self._restart_delay())
 
             await asyncio.sleep(30)  # Check every 30s
+

@@ -1,8 +1,10 @@
 """Configuration loading and validation."""
 
+import datetime as dt
 import sys
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -132,12 +134,76 @@ class PathsConfig(BaseModel):
     api_keys_file: str = "~/.birdbrain/api_keys.json"
 
 
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+class ScheduleConfig(BaseModel):
+    """Daily service window. Outside it every pool's jobs are cancelled, so
+    their GPUs go back to other cluster users; when a window opens the
+    gateway submits fresh jobs (Slurm queue wait comes on top of `start`).
+
+    A window whose `stop` is not after `start` runs overnight into the next
+    day; `days` lists the days windows *start* on.
+    """
+
+    timezone: str = "UTC"
+    start: dt.time
+    stop: dt.time
+    days: list[str] = Field(default_factory=lambda: list(WEEKDAYS))
+
+    @field_validator("timezone")
+    @classmethod
+    def _known_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except Exception:
+            raise ValueError(f"timezone must be an IANA zone name; got {v!r}")
+        return v
+
+    @field_validator("days")
+    @classmethod
+    def _known_days(cls, v: list[str]) -> list[str]:
+        days = [d.lower() for d in v]
+        unknown = set(days) - set(WEEKDAYS)
+        if unknown or not days:
+            raise ValueError(f"days must be a non-empty subset of {WEEKDAYS}; got {v}")
+        return days
+
+    @model_validator(mode="after")
+    def _nonempty_window(self) -> "ScheduleConfig":
+        if self.start == self.stop:
+            raise ValueError("schedule start and stop must differ")
+        return self
+
+    def window_end(self, now_utc: dt.datetime) -> Optional[dt.datetime]:
+        """Stop time of the window containing `now_utc`, or None outside
+        every window. Both are naive UTC, matching datetime.utcnow()."""
+        tz = ZoneInfo(self.timezone)
+        now = now_utc.replace(tzinfo=dt.timezone.utc)
+        today = now.astimezone(tz).date()
+        # The window containing now started today or (overnight) yesterday.
+        for day in (today, today - dt.timedelta(days=1)):
+            if WEEKDAYS[day.weekday()] not in self.days:
+                continue
+            opens = dt.datetime.combine(day, self.start, tzinfo=tz)
+            stop_day = day if self.stop > self.start else day + dt.timedelta(days=1)
+            closes = dt.datetime.combine(stop_day, self.stop, tzinfo=tz)
+            if opens <= now < closes:
+                return closes.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return None
+
+    def is_active(self, now_utc: dt.datetime) -> bool:
+        return self.window_end(now_utc) is not None
+
+
 class Config(BaseModel):
     """Root configuration."""
 
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     backends: list[BackendPoolConfig] = Field(default_factory=list)
+    # Optional service window; None = models run around the clock.
+    schedule: Optional[ScheduleConfig] = None
 
     # Legacy singular fields. Only used to migrate old-style single-model
     # TOML (no [[backends]]) into a single "default" backend pool so

@@ -4,7 +4,9 @@ import tempfile
 
 import pytest
 
-from birdbrain.config import BackendPoolConfig, Config, load_config
+import datetime as dt
+
+from birdbrain.config import BackendPoolConfig, Config, ScheduleConfig, load_config
 
 
 def test_config_defaults():
@@ -180,3 +182,48 @@ def test_load_config_default_when_no_file():
             assert config.gateway.port == 8765  # Default value
         finally:
             os.chdir(old_cwd)
+
+def test_schedule_is_optional_and_default():
+    """No schedule means models run around the clock."""
+    assert Config().schedule is None
+
+
+def test_schedule_window_weekday_and_overnight():
+    """Within-window returns stop in UTC; excluded day returns None; overnight
+    wraps cross midnight into the next calendar day."""
+    sched = ScheduleConfig(timezone="America/New_York", start=dt.time(22), stop=dt.time(2))
+    # 23:00 NY (03:00 UTC) Tuesday, inside a window that started 22:00 Monday
+    now = dt.datetime(2026, 11, 17, 3, 0)
+    assert sched.is_active(now)
+    assert sched.window_end(now) == dt.datetime(2026, 11, 17, 7, 0)  # 02:00 Tue NY
+    # Monday 21:00 NY (02:00 UTC): window started Sunday 22:00, Sunday excluded
+    mon = dt.datetime(2026, 11, 16, 2, 0)
+    assert not sched.is_active(mon)
+    assert sched.window_end(mon) is None
+
+
+def test_schedule_rejects_equal_start_and_stop():
+    with pytest.raises(ValueError):
+        ScheduleConfig(start=dt.time(9), stop=dt.time(9))
+
+
+def test_schedule_rejects_unknown_timezone_and_days():
+    with pytest.raises(ValueError):
+        ScheduleConfig(timezone="bogus", start=dt.time(9), stop=dt.time(10))
+    with pytest.raises(ValueError):
+        ScheduleConfig(start=dt.time(9), stop=dt.time(10), days=["funday"])
+    with pytest.raises(ValueError):
+        ScheduleConfig(start=dt.time(9), stop=dt.time(10), days=[])
+
+
+def test_schedule_days_subset_enforced():
+    """A weekday-only window is inactive on Saturday."""
+    sched = ScheduleConfig(
+        timezone="America/New_York", start=dt.time(7), stop=dt.time(19),
+        days=["mon", "tue", "wed", "thu", "fri"],
+    )
+    sat = dt.datetime(2026, 11, 14, 16, 0)  # 11:00 NY Saturday
+    assert not sched.is_active(sat)
+    assert sched.window_end(sat) is None
+    fri = dt.datetime(2026, 11, 13, 16, 0)  # 11:00 NY Friday
+    assert sched.is_active(fri)

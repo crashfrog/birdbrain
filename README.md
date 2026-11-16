@@ -21,6 +21,7 @@ birdbrain's value is the scheduling/rotation glue *around* a serving engine (Slu
 - **Transparent job rotation** — gateway swaps backends without dropping requests
 - **Multi-model hosting** — run several independently-rotating model pools (e.g. a large model on multiple GPUs plus small models on single GPUs) behind one endpoint, routed by model name or alias, similar to AWS Bedrock
 - **User-level permissions** — no admin privileges required; runs as a regular user
+- **Scheduled uptime/downtime** — an optional `[schedule]` section cancels jobs outside configured hours so GPUs go back to other cluster users overnight
 - **Simple deployment** — `pip install` and a config file; designed for researchers, not SREs
 
 ### Multi-model routing
@@ -181,6 +182,7 @@ See `birdbrain.toml` for all options. Key sections:
 - `[gateway]` — host, port, request retry window
 - `[[backends]]` — one entry per model pool; each has its own `[backends.slurm]` (partition, GPU request, wall-time, lead-time, port) and `[backends.model]` (model name, vLLM arguments), plus an `aliases` list
 - `[paths]` — config file locations, state file, logs directory
+- `[schedule]` *(optional)* — daily service window. When present, all jobs are cancelled outside the window and resubmitted when it opens, so GPUs are returned to other cluster users while the gateway is idle. `start` and `stop` are `HH:MM` wall-clock times interpreted in `timezone` (an IANA zone name; default `UTC`). `days` lists the days a window *starts* on (`mon`…`sun`); default is every day. A `stop` that is not after `start` wraps overnight into the next day. Omit the whole section to run around the clock.
 
 Legacy top-level `[slurm]`/`[model]` tables (no `[[backends]]`) are still supported and are migrated automatically into a single `"default"` backend pool.
 
