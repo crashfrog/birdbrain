@@ -1,4 +1,16 @@
 """Slurm job lifecycle management."""
+        # Slurm's wall-time clock starts now, not at submission: a job can sit
+        # queued for hours. Counting from submission would trigger the next
+        # rotation that much too early, overlapping jobs and holding GPUs.
+        job.expires_at = (
+            start_time + _parse_wall_time(self.backend_config.slurm.wall_time)
+        ).isoformat()
+                previous = self.current_job
+                if previous is not None and previous.job_id != job.job_id:
+                    # The gateway already routes to the new job; the old one
+                    # would otherwise keep its GPUs and ports untracked until
+                    # its wall time.
+                    self._cancel_job(previous, f"replaced by job {job.job_id}")
 
 import asyncio
 import json

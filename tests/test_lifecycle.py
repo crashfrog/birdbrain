@@ -1,4 +1,35 @@
 """Tests for lifecycle manager."""
+@pytest.mark.asyncio
+@patch("birdbrain.lifecycle.subprocess.run")
+async def test_promotion_cancels_replaced_job_and_counts_expiry_from_start(
+    mock_run, mock_gateway, tmp_path
+):
+    """A rotation replacement that registers scancels the job it replaces
+    (else it holds its GPUs untracked until wall time), and its expiry counts
+    from when it started running, not from when it was queued."""
+    mock_gateway.get_backend_urls_by_job = lambda name, job_id: (
+        ["http://g043:50001"] if name == "laguna-xs" else ["http://g043:50002"]
+    )
+    manager = _colocated_manager(mock_gateway, tmp_path)
+    manager.running = True
+    old = _job("100")
+    manager.current_job = old
+    job = manager._record_pending_job("101")
+    job.expires_at = (datetime.utcnow() + timedelta(hours=1)).isoformat()  # stale queue-time estimate
+
+    t0 = datetime(2026, 11, 16, 12, 0)
+    fake_datetime = MagicMock()
+    fake_datetime.utcnow.return_value = t0
+    with patch.object(manager, "_get_job_info", return_value={"state": "RUNNING", "node": "g043"}), \
+            patch("birdbrain.lifecycle.datetime", fake_datetime):
+        await manager._wait_for_job_ready(job)
+
+    assert manager.current_job is job
+    assert job.expires_at == (t0 + timedelta(hours=23)).isoformat()  # default wall_time
+    cancelled = [c.args[0] for c in mock_run.call_args_list if c.args[0][0] == "scancel"]
+    assert cancelled == [["scancel", "100"]]
+
+
 
 import json
 import subprocess
